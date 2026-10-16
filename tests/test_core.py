@@ -120,3 +120,10 @@ def test_resource_limit_is_reported(origin, tmp_path):
     assert record.files <= 2
     assert record.failures >= 1
     assert (library.path(record) / "demo/index.html").is_file()
+
+
+def test_opt_in_full_assets_mode_ignored_for_non_github(origin, tmp_path):
+    library = MirrorLibrary(tmp_path / "other")
+    record = MirrorEngine(library, include_pages_files=True).mirror(origin)
+    assert record.files >= 8
+    assert record.failures == 0
