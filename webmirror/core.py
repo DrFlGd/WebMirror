@@ -240,8 +240,9 @@ class MirrorEngine:
         if kind in ("html", "css", "js", "manifest"):
             text = data.decode("utf-8", errors="replace")
             if kind == "html":
-                if (re.search(r"<title>\\s*Just a moment[.\\s]*</title>", text, re.I)
+                if (re.search(r"<title>\s*Just a moment[.\s]*</title>", text, re.I)
                         or "cf-chl-opt" in text):
+                    self.visited.pop(target, None)
                     return False
                 if local not in self.html_paths:
                     self.html_paths.add(local)
@@ -463,7 +464,7 @@ class MirrorEngine:
                     text = bytes(data).decode(charset, errors="replace")
                     if kind == "html":
                         # Don't archive anti-bot / login challenge pages as a valid site.
-                        if (re.search(r"<title>\\s*Just a moment[.\\s]*</title>", text, re.I)
+                        if (re.search(r"<title>\s*Just a moment[.\s]*</title>", text, re.I)
                                 or "cf-chl-opt" in text):
                             raise ValueError("Cloudflare verification page returned instead of the website")
                         if local not in self.html_paths:
