@@ -156,6 +156,7 @@ class MirrorEngine:
                 raise RuntimeError("The website entry page could not be downloaded.")
             if self.include_pages_files:
                 self._download_github_pages_assets(url)
+            self._write_routes()
             record = MirrorRecord(
                 key=key, url=url, entry=entry,
                 saved_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -184,6 +185,24 @@ class MirrorEngine:
             self.session.close()
             if self.root.exists():
                 shutil.rmtree(self.root, ignore_errors=True)
+
+    def _write_routes(self) -> None:
+        """Map original path+query URLs to their archived filenames.
+
+        SPAs request routes like /app, not our implementation detail
+        /app/index.html; generated URLs may also contain query strings.
+        """
+        routes: dict[str, str] = {}
+        for original, local in self.visited.items():
+            parts = urlsplit(original)
+            if local and (parts.scheme.lower(), parts.netloc.lower()) == self.origin:
+                key = parts.path or "/"
+                if parts.query:
+                    key += "?" + parts.query
+                routes[key] = local
+        (self.root / ".webmirror-routes.json").write_text(
+            json.dumps(routes, indent=2), encoding="utf-8"
+        )
 
     def _download_github_pages_assets(self, url: str) -> None:
         """Optionally include unreferenced published files from a public GitHub Pages repo.
@@ -512,6 +531,36 @@ class _QuietHandler(SimpleHTTPRequestHandler):
         ".woff2": "font/woff2", ".glb": "model/gltf-binary",
     }
 
+    def __init__(self, *args, routes: dict[str, str] | None = None,
+                 entry: str = "/index.html", route_base: str = "/", **kwargs):
+        self.routes = routes or {}
+        self.entry = entry
+        self.route_base = route_base
+        super().__init__(*args, **kwargs)
+
+    def translate_path(self, path: str) -> str:
+        # Match the original browser URL, including query-specific API/asset
+        # responses, to the file saved on disk.
+        parsed = urlsplit(path)
+        lookup = parsed.path or "/"
+        if parsed.query:
+            lookup += "?" + parsed.query
+        saved = self.routes.get(lookup)
+        if saved:
+            return super().translate_path(saved)
+        actual = super().translate_path(path)
+        if os.path.isfile(actual):
+            return actual
+        # SPA history navigation: reload /app/settings through the saved entry.
+        # Never serve HTML in response to a missing .js/.css/image/API asset.
+        wants_html = "text/html" in self.headers.get("Accept", "")
+        target_path = parsed.path or "/"
+        if (wants_html and (target_path == self.route_base.rstrip("/")
+                           or target_path.startswith(self.route_base))
+                and not PurePosixPath(target_path).suffix):
+            return super().translate_path(self.entry)
+        return actual
+
     def log_message(self, format: str, *args: object) -> None:
         pass
 
@@ -532,12 +581,24 @@ class MirrorServer:
         if not (folder / record.entry.lstrip("/")).is_file():
             raise FileNotFoundError("This mirror's entry page is missing.")
         self.stop()
-        handler = partial(_QuietHandler, directory=str(folder))
+        routes_path = folder / ".webmirror-routes.json"
+        try:
+            routes = json.loads(routes_path.read_text("utf-8")) if routes_path.is_file() else {}
+        except (ValueError, OSError):
+            routes = {}
+        original = urlsplit(record.url)
+        base = original.path if original.path.endswith("/") else posixpath.dirname(original.path) + "/"
+        handler = partial(_QuietHandler, directory=str(folder), routes=routes,
+                          entry=record.entry, route_base=base)
         self.httpd = ThreadingHTTPServer(("127.0.0.1", port), handler)
         self.httpd.daemon_threads = True
         self.thread = Thread(target=self.httpd.serve_forever, daemon=True, name="webmirror-http")
         self.thread.start()
-        self.url = f"http://127.0.0.1:{port}" + quote(record.entry, safe="/%")
+        original = urlsplit(record.url)
+        path = quote(original.path or "/", safe="/%:@")
+        self.url = f"http://127.0.0.1:{port}" + path
+        if original.query:
+            self.url += "?" + original.query
         return self.url
 
     def stop(self) -> None:
