@@ -12,6 +12,7 @@ A small Python desktop app for saving public, mostly static websites and serving
 - Preserve URL subpaths (for example, `/terrain-press/` on GitHub Pages).
 - Optional **GitHub Pages: include all published repository files** mode to capture data files with dynamically computed names (may consume hundreds of MB).
 - **Dynamic browser capture** (enabled by default in the GUI) observes assets fetched by JavaScript in a clean Chrome/Edge browser session. It can recover lazy bundles, images, fonts, WASM and public initial GET data.
+- **Human verification handoff:** If a robot-check interstitial appears, WebMirror can open a visible browser so you complete the check yourself and then continue capturing eligible public assets (subject to website restrictions).
 - Original SPA routes (such as `/drawer` and `/app`) and query-string asset URLs work when hosting offline. Nested client-side routes fall back to the saved app shell.
 - Host only on `127.0.0.1`, not on your network.
 
@@ -72,6 +73,19 @@ In the app, enter `https://ianbauters.github.io/terrain-press/` (or another publ
 Websites that use long opaque JavaScript or image URLs (including certain ad and analytics resources on \`https://3dp.rocks/lithophane/\`) previously could fail with a Windows path such as \`C:\Users\...\mirrors\.webmirror-...\<very-long-token>.js\`. WebMirror now shortens the **saved local filename** to a deterministic hash, while retaining the original URL in its local server's route map. Deep folder structures also use short hashed local paths. No change to Windows' registry or LongPathsEnabled setting is required.
 
 If an older WebMirror build displayed a long filename error, install a fresh executable and **mirror the website again**. Partial temporary snapshots will not appear in the library; existing completed mirrors remain available.
+
+## Human-verification checks
+
+Enable both checkboxes under **Mirror a website**:
+
+1. **Capture JavaScript-loaded assets with Chrome or Edge.**
+2. **Let me complete human-verification checks in an opened browser.**
+
+If the site presents a recognized challenge (for example a Cloudflare “Just a moment…” page), WebMirror opens a temporary, visible Chrome or Edge window and displays a notice in its GUI. **You** complete the check using the browser window. WebMirror observes the page, resumes capture when the verification clears, and closes the temporary window. Closing the window yourself cancels the verification; checks have a maximum of **three minutes**.
+
+Use this only for publicly accessible pages you are authorized to mirror. **Do not sign into personal accounts, enter passwords, or provide sensitive information in the verification window.** WebMirror uses a fresh temporary browser context and does not reuse your browser profile or save its cookies. It cannot defeat a challenge automatically, bypass site policy, or guarantee that a website permits automated capture even after verification. Cloudflare may still reject the browser. Some backend-dependent app functions remain unavailable offline.
+
+If **Capture JavaScript-loaded assets** is unchecked, verification prompts are disabled. Failed captures do not overwrite older successfully saved snapshots.
 
 ## Important limitations
 
