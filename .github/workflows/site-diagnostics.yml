@@ -1,0 +1,52 @@
+name: Diagnose sample sites
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/site-diagnostics.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install requests beautifulsoup4
+      - name: Fetch publicly accessible entry pages and referenced resources
+        shell: bash
+        run: |
+          python - <<'PY'
+          import requests
+          from bs4 import BeautifulSoup
+          from urllib.parse import urljoin, urlsplit
+          for target in ("https://fitforge-c5058.web.app/drawer", "https://orbitstudio3d.com/app"):
+              print("\n=== ", target, " ===", flush=True)
+              try:
+                  r = requests.get(target, timeout=20, headers={"User-Agent": "Mozilla/5.0 WebMirror-Diagnostics"})
+                  print("ENTRY", r.status_code, r.url, "type", r.headers.get("Content-Type"), "bytes", len(r.content))
+                  print("CSP", (r.headers.get("Content-Security-Policy") or "")[:350])
+                  soup = BeautifulSoup(r.text, "html.parser")
+                  title = soup.find("title")
+                  print("TITLE", title.get_text(" ", strip=True)[:200] if title else "[none]")
+                  assets = []
+                  for tag, attribute in [("script", "src"), ("link", "href"), ("img", "src")]:
+                      for element in soup.find_all(tag):
+                          if element.get(attribute):
+                              assets.append(urljoin(r.url, element[attribute]))
+                  print("STATIC REFERENCES", len(assets))
+                  for asset in assets[:8]:
+                      try:
+                          rr = requests.get(asset, timeout=15, stream=True, headers={"User-Agent": "Mozilla/5.0 WebMirror-Diagnostics"})
+                          print("ASSET", rr.status_code, rr.headers.get("Content-Type"), asset[:190])
+                          rr.close()
+                      except Exception as exc:
+                          print("ASSET ERR", type(exc).__name__, str(exc)[:200])
+              except Exception as exc:
+                  print("ENTRY ERR", type(exc).__name__, str(exc)[:260])
+          PY
