@@ -67,6 +67,12 @@ Alternatively launch with the installed `webmirror` command.
 
 In the app, enter `https://ianbauters.github.io/terrain-press/` (or another publicly accessible website), click **Mirror website**, select it from the library, and click **Host selected**. Click **Open in browser** to visit its local address. For the Terrain Press example, tick **GitHub Pages: include all published repository files** before mirroring to also download the project's elevation tiles (a potentially large download). Port `8000` is the default; change it if that port is already in use. Mirrored files live in `~/.webmirror/mirrors/` by default (override with the `WEBMIRROR_HOME` environment variable).
 
+## Windows long-path handling
+
+Websites that use long opaque JavaScript or image URLs (including certain ad and analytics resources on \`https://3dp.rocks/lithophane/\`) previously could fail with a Windows path such as \`C:\Users\...\mirrors\.webmirror-...\<very-long-token>.js\`. WebMirror now shortens the **saved local filename** to a deterministic hash, while retaining the original URL in its local server's route map. Deep folder structures also use short hashed local paths. No change to Windows' registry or LongPathsEnabled setting is required.
+
+If an older WebMirror build displayed a long filename error, install a fresh executable and **mirror the website again**. Partial temporary snapshots will not appear in the library; existing completed mirrors remain available.
+
 ## Important limitations
 
 ### JavaScript-heavy apps and offline limitations
