@@ -78,7 +78,7 @@ class FakePage:
             )
             self.callbacks["response"](
                 FakeResponse(
-                    self.url.rsplit("/", 1)[0] + "/app.js", 200,
+                    "https://example.org/app.js", 200,
                     b"window.ready = true;", "application/javascript",
                 )
             )
