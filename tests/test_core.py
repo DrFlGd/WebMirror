@@ -300,3 +300,29 @@ def test_captured_js_chunk_is_written_to_expected_root_path(tmp_path):
     )
     assert (engine.root / "assets/chunk-RANDOM123.js").exists()
     assert engine.visited["https://example.org/assets/chunk-RANDOM123.js"] == "/assets/chunk-RANDOM123.js"
+
+
+
+def test_cloudflare_challenge_is_not_saved_as_a_valid_website(origin, tmp_path):
+    from unittest.mock import patch
+
+    class FakeResponse:
+        headers = {"Content-Type": "text/html"}
+        encoding = "utf-8"
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def raise_for_status(self):
+            pass
+        def iter_content(self, chunk_size):
+            yield b"<html><head><title>Just a moment...</title></head><body>cf-chl-opt</body></html>"
+
+    def fake_get(self, url, **kwargs):
+        return FakeResponse()
+
+    with patch("requests.Session.get", fake_get):
+        library = MirrorLibrary(tmp_path / "data")
+        with pytest.raises(RuntimeError, match="Cloudflare"):
+            MirrorEngine(library).mirror("https://example.org/app")
+        assert not library.list()
