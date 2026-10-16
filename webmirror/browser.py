@@ -45,7 +45,7 @@ def is_verification_challenge(
         return True
     if any(marker in sample for marker in (
         "cf-chl-opt", "cf-challenge-running", "id=\"challenge-running\"",
-        "id='challenge-running'", "challenges.cloudflare.com/turnstile",
+        "id='challenge-running'",
     )):
         return True
     if status in (403, 429, 503) and any(marker in sample for marker in (
@@ -197,24 +197,37 @@ def capture_public_assets(
                         if on_verification_required:
                             on_verification_required(message)
                         deadline = monotonic() + max(1, verification_timeout)
-                        while _page_is_challenged(page, None):
+                        while True:
                             if page.is_closed():
                                 raise VerificationIncomplete("The verification browser was closed.")
+                            if not _page_is_challenged(page, None):
+                                break
                             if monotonic() >= deadline:
                                 raise VerificationIncomplete(
                                     "Verification was not completed within the allowed time."
                                 )
                             page.wait_for_timeout(750)
                         progress("Verification completed; capturing visible website resources.")
+                    if page.is_closed():
+                        raise VerificationIncomplete("The verification browser was closed.")
                     settle(page)
+                    if page.is_closed():
+                        raise VerificationIncomplete("The verification browser was closed.")
                     if _page_is_challenged(page, None):
                         raise VerificationIncomplete(
                             "The website presented another verification check; capture was stopped."
                         )
                 finally:
-                    context.close()
+                    try:
+                        context.close()
+                    except Exception:
+                        # The user may have closed the visible browser themselves.
+                        pass
             finally:
-                browser.close()
+                try:
+                    browser.close()
+                except Exception:
+                    pass
         elif challenged:
             progress(
                 "Site verification detected. Enable manual verification in the "
