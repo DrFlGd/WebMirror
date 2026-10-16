@@ -125,12 +125,13 @@ class MirrorEngine:
 
     def __init__(self, library: MirrorLibrary, progress: Callable[[str], None] | None = None,
                  max_files: int = MAX_FILES, max_bytes: int = MAX_BYTES,
-                 include_pages_files: bool = False):
+                 include_pages_files: bool = False, browser_capture: bool = False):
         self.library = library
         self.progress = progress or (lambda message: None)
         self.max_files = max_files
         self.max_bytes = max_bytes
         self.include_pages_files = include_pages_files
+        self.browser_capture = browser_capture
 
     def mirror(self, supplied_url: str) -> MirrorRecord:
         url = normalize_url(supplied_url)
@@ -152,10 +153,18 @@ class MirrorEngine:
         backup = self.library.directory / f".{key}-backup"
         try:
             entry = self._download(url, hint="html")
+            if self.browser_capture:
+                self._capture_browser(url)
+                entry = self.visited.get(url) or entry
             if not entry:
-                raise RuntimeError("The website entry page could not be downloaded.")
+                detail = self.failures[0] if self.failures else "Unknown error"
+                raise RuntimeError(
+                    "The website entry page could not be downloaded. " + detail[:350]
+                    + ". Sites requiring login or bot challenges cannot be bypassed."
+                )
             if self.include_pages_files:
                 self._download_github_pages_assets(url)
+            self._write_routes()
             record = MirrorRecord(
                 key=key, url=url, entry=entry,
                 saved_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -184,6 +193,89 @@ class MirrorEngine:
             self.session.close()
             if self.root.exists():
                 shutil.rmtree(self.root, ignore_errors=True)
+
+    def _capture_browser(self, url: str) -> None:
+        """Copy additional GET resources requested during a real page load."""
+        try:
+            from .browser import BrowserUnavailable, capture_public_assets
+            self.progress("Opening a clean Chromium browser to discover dynamic resources...")
+            assets = capture_public_assets(
+                url, max_files=self.max_files, max_bytes=self.max_bytes,
+                progress=self.progress,
+            )
+        except (BrowserUnavailable, OSError, RuntimeError) as exc:
+            self.failures.append("Browser capture unavailable: " + str(exc)[:300])
+            self.progress("Browser capture unavailable: " + str(exc)[:300])
+            return
+        added = 0
+        for target, mime, data in assets:
+            if self._store_browser_asset(target, mime, data):
+                added += 1
+        self.progress(f"Captured {added} additional dynamic resources.")
+
+    def _store_browser_asset(self, target: str, mime: str, data: bytes) -> bool:
+        """Store a browser-observed resource, without refetching or losing its URL."""
+        parts = urlsplit(target)
+        if (parts.scheme.lower(), parts.netloc.lower()) != self.origin:
+            return False
+        if len(data) > self.max_bytes or len(self.visited) >= self.max_files:
+            return False
+        if mime in ("text/html", "application/xhtml+xml"):
+            kind = "html"
+        elif mime == "text/css":
+            kind = "css"
+        elif mime in ("text/javascript", "application/javascript", "application/x-javascript"):
+            kind = "js"
+        elif mime == "application/manifest+json":
+            kind = "manifest"
+        else:
+            kind = mime
+        relative = self._destination(target, kind)
+        local = "/" + relative.as_posix()
+        output = self.root / relative
+        if output.is_file():
+            self.visited[target] = local
+            return False
+        self.visited[target] = local
+        if kind in ("html", "css", "js", "manifest"):
+            text = data.decode("utf-8", errors="replace")
+            if kind == "html":
+                if (re.search(r"<title>\s*Just a moment[.\s]*</title>", text, re.I)
+                        or "cf-chl-opt" in text):
+                    self.visited.pop(target, None)
+                    return False
+                if local not in self.html_paths:
+                    self.html_paths.add(local)
+                    self.pages += 1
+                text = self._rewrite_html(text, target)
+            elif kind == "css":
+                text = self._rewrite_css(text, target)
+            elif kind == "js":
+                text = self._rewrite_js(text, target)
+            elif kind == "manifest":
+                text = self._rewrite_manifest(text, target)
+            data = text.encode("utf-8")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(data)
+        return True
+
+    def _write_routes(self) -> None:
+        """Map original path+query URLs to their archived filenames.
+
+        SPAs request routes like /app, not our implementation detail
+        /app/index.html; generated URLs may also contain query strings.
+        """
+        routes: dict[str, str] = {}
+        for original, local in self.visited.items():
+            parts = urlsplit(original)
+            if local and (parts.scheme.lower(), parts.netloc.lower()) == self.origin:
+                key = parts.path or "/"
+                if parts.query:
+                    key += "?" + parts.query
+                routes[key] = local
+        (self.root / ".webmirror-routes.json").write_text(
+            json.dumps(routes, indent=2), encoding="utf-8"
+        )
 
     def _download_github_pages_assets(self, url: str) -> None:
         """Optionally include unreferenced published files from a public GitHub Pages repo.
@@ -371,6 +463,10 @@ class MirrorEngine:
                     charset = response.encoding or "utf-8"
                     text = bytes(data).decode(charset, errors="replace")
                     if kind == "html":
+                        # Don't archive anti-bot / login challenge pages as a valid site.
+                        if (re.search(r"<title>\s*Just a moment[.\s]*</title>", text, re.I)
+                                or "cf-chl-opt" in text):
+                            raise ValueError("Cloudflare verification page returned instead of the website")
                         if local not in self.html_paths:
                             self.html_paths.add(local)
                             self.pages += 1
@@ -512,6 +608,34 @@ class _QuietHandler(SimpleHTTPRequestHandler):
         ".woff2": "font/woff2", ".glb": "model/gltf-binary",
     }
 
+    def __init__(self, *args, routes: dict[str, str] | None = None,
+                 entry: str = "/index.html", route_base: str = "/", **kwargs):
+        self.routes = routes or {}
+        self.entry = entry
+        self.route_base = route_base
+        super().__init__(*args, **kwargs)
+
+    def translate_path(self, path: str) -> str:
+        # Match the original browser URL, including query-specific API/asset
+        # responses, to the file saved on disk.
+        parsed = urlsplit(path)
+        lookup = parsed.path or "/"
+        if parsed.query:
+            lookup += "?" + parsed.query
+        saved = self.routes.get(lookup)
+        if saved:
+            return super().translate_path(saved)
+        actual = super().translate_path(path)
+        if os.path.isfile(actual):
+            return actual
+        # SPA history navigation: reload /app/settings through the saved entry.
+        # Never serve HTML in response to a missing .js/.css/image/API asset.
+        wants_html = "text/html" in self.headers.get("Accept", "")
+        target_path = parsed.path or "/"
+        if wants_html and not PurePosixPath(target_path).suffix:
+            return super().translate_path(self.entry)
+        return actual
+
     def log_message(self, format: str, *args: object) -> None:
         pass
 
@@ -532,12 +656,24 @@ class MirrorServer:
         if not (folder / record.entry.lstrip("/")).is_file():
             raise FileNotFoundError("This mirror's entry page is missing.")
         self.stop()
-        handler = partial(_QuietHandler, directory=str(folder))
+        routes_path = folder / ".webmirror-routes.json"
+        try:
+            routes = json.loads(routes_path.read_text("utf-8")) if routes_path.is_file() else {}
+        except (ValueError, OSError):
+            routes = {}
+        original = urlsplit(record.url)
+        base = original.path if original.path.endswith("/") else posixpath.dirname(original.path) + "/"
+        handler = partial(_QuietHandler, directory=str(folder), routes=routes,
+                          entry=record.entry, route_base=base)
         self.httpd = ThreadingHTTPServer(("127.0.0.1", port), handler)
         self.httpd.daemon_threads = True
         self.thread = Thread(target=self.httpd.serve_forever, daemon=True, name="webmirror-http")
         self.thread.start()
-        self.url = f"http://127.0.0.1:{port}" + quote(record.entry, safe="/%")
+        original = urlsplit(record.url)
+        path = quote(original.path or "/", safe="/%:@")
+        self.url = f"http://127.0.0.1:{port}" + path
+        if original.query:
+            self.url += "?" + original.query
         return self.url
 
     def stop(self) -> None:
