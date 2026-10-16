@@ -13,6 +13,34 @@ A small Python desktop app for saving public, mostly static websites and serving
 - Optional **GitHub Pages: include all published repository files** mode to capture data files with dynamically computed names (may consume hundreds of MB).
 - Host only on `127.0.0.1`, not on your network.
 
+## Download a ready-to-run executable
+
+**No Python installation is needed** to run the packaged app.
+
+1. Open [GitHub Actions — Build desktop executables](https://github.com/DrFlGd/WebMirror/actions/workflows/build.yml).
+2. Open the most recent **successful** run on `main`.
+3. Under **Artifacts**, download the package for your operating system:
+   - **WebMirror-Windows** — unzip and double-click `WebMirror.exe` (portable executable, no installer).
+   - **WebMirror-macOS** — unzip `WebMirror-macOS.zip`, then open `WebMirror.app`.
+   - **WebMirror-Linux** — extract `WebMirror-Linux.tar.gz` and run `./WebMirror`.
+
+GitHub may require you to sign in to download workflow artifacts. These binaries are **unsigned**: Windows SmartScreen or macOS Gatekeeper may show a security warning. Only run files downloaded from the project's own Actions workflow and review the code if you have concerns. On macOS, use Finder's **Open** context-menu option if Gatekeeper blocks the unsigned app. On Linux, install desktop Tcl/Tk libraries if the app cannot launch.
+
+These build artifacts expire after **90 days**. The build workflow also has a **Run workflow** button to create new downloads.
+
+Each executable saves mirrors in your user directory (`~/.webmirror/mirrors`), **not** next to the executable, so replacing an older build keeps your saved websites.
+
+### Build locally
+
+On a computer with Python 3.10+ installed (and Tkinter available):
+
+```bash
+python -m pip install -e . "pyinstaller>=6.11,<7"
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name WebMirror launcher.py
+```
+
+On Windows, the executable appears at `dist/WebMirror.exe`. On Linux it is `dist/WebMirror`. On macOS, GitHub Actions instead packages a `WebMirror.app` bundle with the `--onedir --windowed` flags.
+
 ## Requirements
 
 - Python **3.10+**
