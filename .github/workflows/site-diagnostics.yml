@@ -20,6 +20,13 @@ jobs:
       - run: python -m pip install -e ".[dynamic]"
       - name: Live FitForge offline smoke test
         run: python scripts/smoke_live.py
+      - name: Upload offline screenshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: fitforge-local-render
+          path: artifacts/fitforge-offline.png
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Fetch publicly accessible entry pages and referenced resources
         shell: bash
         run: |
