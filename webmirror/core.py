@@ -125,12 +125,13 @@ class MirrorEngine:
 
     def __init__(self, library: MirrorLibrary, progress: Callable[[str], None] | None = None,
                  max_files: int = MAX_FILES, max_bytes: int = MAX_BYTES,
-                 include_pages_files: bool = False):
+                 include_pages_files: bool = False, browser_capture: bool = False):
         self.library = library
         self.progress = progress or (lambda message: None)
         self.max_files = max_files
         self.max_bytes = max_bytes
         self.include_pages_files = include_pages_files
+        self.browser_capture = browser_capture
 
     def mirror(self, supplied_url: str) -> MirrorRecord:
         url = normalize_url(supplied_url)
@@ -152,6 +153,9 @@ class MirrorEngine:
         backup = self.library.directory / f".{key}-backup"
         try:
             entry = self._download(url, hint="html")
+            if self.browser_capture:
+                self._capture_browser(url)
+                entry = self.visited.get(url) or entry
             if not entry:
                 raise RuntimeError("The website entry page could not be downloaded.")
             if self.include_pages_files:
@@ -185,6 +189,67 @@ class MirrorEngine:
             self.session.close()
             if self.root.exists():
                 shutil.rmtree(self.root, ignore_errors=True)
+
+    def _capture_browser(self, url: str) -> None:
+        """Copy additional GET resources requested during a real page load."""
+        try:
+            from .browser import BrowserUnavailable, capture_public_assets
+            self.progress("Opening a clean Chromium browser to discover dynamic resources...")
+            assets = capture_public_assets(
+                url, max_files=self.max_files, max_bytes=self.max_bytes,
+                progress=self.progress,
+            )
+        except (BrowserUnavailable, OSError, RuntimeError) as exc:
+            self.failures.append("Browser capture unavailable: " + str(exc)[:300])
+            self.progress("Browser capture unavailable: " + str(exc)[:300])
+            return
+        added = 0
+        for target, mime, data in assets:
+            if self._store_browser_asset(target, mime, data):
+                added += 1
+        self.progress(f"Captured {added} additional dynamic resources.")
+
+    def _store_browser_asset(self, target: str, mime: str, data: bytes) -> bool:
+        """Store a browser-observed resource, without refetching or losing its URL."""
+        parts = urlsplit(target)
+        if (parts.scheme.lower(), parts.netloc.lower()) != self.origin:
+            return False
+        if len(data) > self.max_bytes or len(self.visited) >= self.max_files:
+            return False
+        if mime in ("text/html", "application/xhtml+xml"):
+            kind = "html"
+        elif mime == "text/css":
+            kind = "css"
+        elif mime in ("text/javascript", "application/javascript", "application/x-javascript"):
+            kind = "js"
+        elif mime == "application/manifest+json":
+            kind = "manifest"
+        else:
+            kind = mime
+        relative = self._destination(target, kind)
+        local = "/" + relative.as_posix()
+        output = self.root / relative
+        if output.is_file():
+            self.visited[target] = local
+            return False
+        self.visited[target] = local
+        if kind in ("html", "css", "js", "manifest"):
+            text = data.decode("utf-8", errors="replace")
+            if kind == "html":
+                if local not in self.html_paths:
+                    self.html_paths.add(local)
+                    self.pages += 1
+                text = self._rewrite_html(text, target)
+            elif kind == "css":
+                text = self._rewrite_css(text, target)
+            elif kind == "js":
+                text = self._rewrite_js(text, target)
+            elif kind == "manifest":
+                text = self._rewrite_manifest(text, target)
+            data = text.encode("utf-8")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(data)
+        return True
 
     def _write_routes(self) -> None:
         """Map original path+query URLs to their archived filenames.
