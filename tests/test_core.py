@@ -369,7 +369,7 @@ def test_windows_overlong_asset_name_is_shortened_and_still_serves(tmp_path):
     other = engine._destination(alternate, "js")
     assert other != rel
 
-    (engine.root / "lithophane").mkdir()
+    (engine.root / "lithophane").mkdir(exist_ok=True)
     (engine.root / "lithophane/index.html").write_text("<title>Lithophane</title>")
     engine._write_routes()
     host = MirrorServer(library)
