@@ -620,9 +620,7 @@ class _QuietHandler(SimpleHTTPRequestHandler):
         # Never serve HTML in response to a missing .js/.css/image/API asset.
         wants_html = "text/html" in self.headers.get("Accept", "")
         target_path = parsed.path or "/"
-        if (wants_html and (target_path == self.route_base.rstrip("/")
-                           or target_path.startswith(self.route_base))
-                and not PurePosixPath(target_path).suffix):
+        if wants_html and not PurePosixPath(target_path).suffix:
             return super().translate_path(self.entry)
         return actual
 
