@@ -157,7 +157,11 @@ class MirrorEngine:
                 self._capture_browser(url)
                 entry = self.visited.get(url) or entry
             if not entry:
-                raise RuntimeError("The website entry page could not be downloaded.")
+                detail = self.failures[0] if self.failures else "Unknown error"
+                raise RuntimeError(
+                    "The website entry page could not be downloaded. " + detail[:350]
+                    + ". Sites requiring login or bot challenges cannot be bypassed."
+                )
             if self.include_pages_files:
                 self._download_github_pages_assets(url)
             self._write_routes()
@@ -236,6 +240,9 @@ class MirrorEngine:
         if kind in ("html", "css", "js", "manifest"):
             text = data.decode("utf-8", errors="replace")
             if kind == "html":
+                if (re.search(r"<title>\\s*Just a moment[.\\s]*</title>", text, re.I)
+                        or "cf-chl-opt" in text):
+                    return False
                 if local not in self.html_paths:
                     self.html_paths.add(local)
                     self.pages += 1
@@ -455,6 +462,10 @@ class MirrorEngine:
                     charset = response.encoding or "utf-8"
                     text = bytes(data).decode(charset, errors="replace")
                     if kind == "html":
+                        # Don't archive anti-bot / login challenge pages as a valid site.
+                        if (re.search(r"<title>\\s*Just a moment[.\\s]*</title>", text, re.I)
+                                or "cf-chl-opt" in text):
+                            raise ValueError("Cloudflare verification page returned instead of the website")
                         if local not in self.html_paths:
                             self.html_paths.add(local)
                             self.pages += 1
