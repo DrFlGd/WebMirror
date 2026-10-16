@@ -406,3 +406,87 @@ def test_windows_reserved_names_are_safe(tmp_path):
     engine.origin = ("https", "example.org")
     assert engine._destination("https://example.org/CON.txt", "text/plain").name == "_CON.txt"
     assert engine._destination("https://example.org/COM1.js", "js").name == "_COM1.js"
+
+
+
+def test_static_403_recovers_via_user_verified_browser_capture(tmp_path, monkeypatch):
+    """Verified browser HTML becomes the entry page without reusing cookies."""
+    from unittest.mock import patch
+
+    library = MirrorLibrary(tmp_path / "data")
+    notices = []
+    source = "https://example.org/app"
+    responses = [
+        (source, "text/html", b'<html><head><title>App</title><script src="/assets/main.js"></script></head><body>Hello</body></html>'),
+        ("https://example.org/assets/main.js", "application/javascript", b"window.webmirror = true;"),
+    ]
+
+    class ForbiddenResponse:
+        headers = {"Content-Type": "text/html"}
+        encoding = "utf-8"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def raise_for_status(self):
+            raise requests.HTTPError("403 Forbidden - challenge")
+
+    def fake_capture(url, *, on_verification_required, **kwargs):
+        assert kwargs["allow_manual_verification"]
+        on_verification_required("Complete human verification in the browser.")
+        return responses
+
+    with patch("requests.Session.get", return_value=ForbiddenResponse()), patch(
+        "webmirror.browser.capture_public_assets", side_effect=fake_capture
+    ):
+        record = MirrorEngine(
+            library,
+            browser_capture=True,
+            manual_verification=True,
+            on_verification_required=notices.append,
+        ).mirror(source)
+
+    assert record.entry == "/app/index.html"
+    assert notices == ["Complete human verification in the browser."]
+    folder = library.path(record)
+    page = (folder / "app/index.html").read_text()
+    assert 'src="/assets/main.js"' in page
+    assert (folder / "assets/main.js").read_bytes() == b"window.webmirror = true;"
+    assert record.files >= 2
+    assert record.pages == 1
+    assert library.list() == [record]
+
+
+def test_failed_browser_verification_does_not_replace_existing_snapshot(origin, tmp_path):
+    """A challenged refresh must never destroy a previously complete mirror."""
+    from unittest.mock import patch
+    from webmirror.browser import VerificationIncomplete
+
+    library = MirrorLibrary(tmp_path / "data")
+    record = MirrorEngine(library).mirror(origin)
+    original = (library.path(record) / "demo/index.html").read_bytes()
+
+    class ForbiddenResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def raise_for_status(self):
+            raise requests.HTTPError("403 Forbidden")
+
+    with patch("requests.Session.get", return_value=ForbiddenResponse()), patch(
+        "webmirror.browser.capture_public_assets",
+        side_effect=VerificationIncomplete("Human check cancelled."),
+    ):
+        with pytest.raises(RuntimeError, match="entry page"):
+            MirrorEngine(
+                library, browser_capture=True, manual_verification=True,
+            ).mirror(origin)
+
+    assert (library.path(record) / "demo/index.html").read_bytes() == original
+    assert library.list() == [record]
