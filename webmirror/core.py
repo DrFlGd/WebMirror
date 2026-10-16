@@ -142,6 +142,7 @@ class MirrorEngine:
         self.in_progress: set[str] = set()
         self.failures: list[str] = []
         self.pages = 0
+        self.html_paths: set[str] = set()
         self.extra_files = 0
         self.root = Path(tempfile.mkdtemp(prefix=".webmirror-", dir=self.library.directory))
         self.session = requests.Session()
@@ -158,7 +159,7 @@ class MirrorEngine:
             record = MirrorRecord(
                 key=key, url=url, entry=entry,
                 saved_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                files=sum(bool(item) for item in self.visited.values()) + self.extra_files,
+                files=len({item for item in self.visited.values() if item}) + self.extra_files,
                 pages=self.pages, failures=len(self.failures),
             )
             (self.root / "manifest.json").write_text(
@@ -370,7 +371,9 @@ class MirrorEngine:
                     charset = response.encoding or "utf-8"
                     text = bytes(data).decode(charset, errors="replace")
                     if kind == "html":
-                        self.pages += 1
+                        if local not in self.html_paths:
+                            self.html_paths.add(local)
+                            self.pages += 1
                         text = self._rewrite_html(text, target)
                     elif kind == "css":
                         text = self._rewrite_css(text, target)
