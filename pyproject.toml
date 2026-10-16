@@ -12,6 +12,7 @@ dependencies = ["requests>=2.31,<3", "beautifulsoup4>=4.12,<5"]
 
 [project.optional-dependencies]
 test = ["pytest>=8,<10"]
+dynamic = ["playwright>=1.50,<2"]
 
 [project.scripts]
 webmirror = "webmirror.gui:main"
