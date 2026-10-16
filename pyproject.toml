@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "webmirror"
+version = "0.1.0"
+description = "Desktop GUI to mirror and locally host static websites"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["requests>=2.31,<3", "beautifulsoup4>=4.12,<5"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+webmirror = "webmirror.gui:main"
+
+[tool.setuptools.packages.find]
+include = ["webmirror*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
