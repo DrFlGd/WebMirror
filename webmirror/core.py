@@ -442,7 +442,7 @@ class MirrorEngine:
         """Keep local path components short, unique and Windows-compatible."""
         stem, ext = os.path.splitext(name)
         # Invalid or immense extensions should not crowd out the hash.
-        ext = ext[:16] if re.fullmatch(r"\\.[A-Za-z0-9]{1,15}", ext) else ""
+        ext = ext[:16] if re.fullmatch(r"\.[A-Za-z0-9]{1,15}", ext) else ""
         if len(name) > MAX_LOCAL_COMPONENT:
             token = sha256(name.encode("utf-8")).hexdigest()[:16]
             available = MAX_LOCAL_COMPONENT - len(ext) - len(token) - 1
