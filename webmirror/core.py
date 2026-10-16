@@ -129,13 +129,17 @@ class MirrorEngine:
 
     def __init__(self, library: MirrorLibrary, progress: Callable[[str], None] | None = None,
                  max_files: int = MAX_FILES, max_bytes: int = MAX_BYTES,
-                 include_pages_files: bool = False, browser_capture: bool = False):
+                 include_pages_files: bool = False, browser_capture: bool = False,
+                 manual_verification: bool = False,
+                 on_verification_required: Callable[[str], None] | None = None):
         self.library = library
         self.progress = progress or (lambda message: None)
         self.max_files = max_files
         self.max_bytes = max_bytes
         self.include_pages_files = include_pages_files
         self.browser_capture = browser_capture
+        self.manual_verification = manual_verification
+        self.on_verification_required = on_verification_required
 
     def mirror(self, supplied_url: str) -> MirrorRecord:
         url = normalize_url(supplied_url)
@@ -144,6 +148,7 @@ class MirrorEngine:
         path = parsed.path or "/"
         self.scope = path if path.endswith("/") else posixpath.dirname(path) + "/"
         self.visited: dict[str, str | None] = {}
+        self._browser_assets: dict[str, tuple[str, bytes]] = {}
         self.in_progress: set[str] = set()
         self.failures: list[str] = []
         self.pages = 0
@@ -206,15 +211,27 @@ class MirrorEngine:
             assets = capture_public_assets(
                 url, max_files=self.max_files, max_bytes=self.max_bytes,
                 progress=self.progress,
+                allow_manual_verification=self.manual_verification,
+                on_verification_required=self.on_verification_required,
             )
         except (BrowserUnavailable, OSError, RuntimeError) as exc:
             self.failures.append("Browser capture unavailable: " + str(exc)[:300])
             self.progress("Browser capture unavailable: " + str(exc)[:300])
             return
+        # A successful browser verification may make resources available that
+        # Requests could not fetch. Process them from the browser's actual
+        # responses, without replaying challenge cookies into Requests.
+        self._browser_assets = {
+            target: (mime, data) for target, mime, data in assets
+        }
+        for target in self._browser_assets:
+            if self.visited.get(target) is None:
+                self.visited.pop(target, None)
         added = 0
         for target, mime, data in assets:
-            if self._store_browser_asset(target, mime, data):
+            if target not in self.visited and self._store_browser_asset(target, mime, data):
                 added += 1
+        self._browser_assets.clear()
         self.progress(f"Captured {added} additional dynamic resources.")
 
     def _store_browser_asset(self, target: str, mime: str, data: bytes) -> bool:
@@ -458,6 +475,14 @@ class MirrorEngine:
             return self.visited[target]
         if target in self.in_progress:
             return None
+        if target in getattr(self, "_browser_assets", {}):
+            mime, data = self._browser_assets[target]
+            self.in_progress.add(target)
+            try:
+                self._store_browser_asset(target, mime, data)
+                return self.visited.get(target)
+            finally:
+                self.in_progress.discard(target)
         if len(self.visited) >= self.max_files:
             if "resource limit reached" not in self.failures:
                 self.failures.append("resource limit reached")
