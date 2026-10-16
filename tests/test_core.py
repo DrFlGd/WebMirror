@@ -326,3 +326,83 @@ def test_cloudflare_challenge_is_not_saved_as_a_valid_website(origin, tmp_path):
         with pytest.raises(RuntimeError, match="Cloudflare"):
             MirrorEngine(library).mirror("https://example.org/app")
         assert not library.list()
+
+
+
+def test_windows_overlong_asset_name_is_shortened_and_still_serves(tmp_path):
+    """Real-world ad/script endpoints can generate >400-character .js names."""
+    from datetime import datetime, timezone
+    from webmirror.core import MirrorRecord
+
+    library = MirrorLibrary(tmp_path / "data")
+    record = MirrorRecord(
+        key="3dp-rocks-123456abcdef", url="https://3dp.rocks/lithophane/",
+        entry="/lithophane/index.html",
+        saved_at=datetime.now(timezone.utc).isoformat(),
+        files=2, pages=1, failures=0,
+    )
+    engine = MirrorEngine(library)
+    engine.origin = ("https", "3dp.rocks")
+    engine.scope = "/lithophane/"
+    engine.root = library.path(record)
+    engine.root.mkdir()
+    engine.visited = {}
+    engine.html_paths = set()
+    engine.pages = 0
+    engine.in_progress = set()
+    engine.failures = []
+
+    token = "0dxm3_" + ("rUs9WP8afH2kL05MQnYgXx72AbC" * 16)
+    long_url = f"https://3dp.rocks/lithophane/{token}.js"
+    payload = b'window.veryLongFilename = true;'
+    assert len(token) > 255
+    assert engine._store_browser_asset(long_url, "application/javascript", payload)
+    rel = engine._destination(long_url, "js")
+    assert rel.suffix == ".js"
+    assert max(len(piece) for piece in rel.parts) <= 96
+    assert len(rel.as_posix()) <= 160
+    assert (engine.root / rel).read_bytes() == payload
+    assert engine._destination(long_url, "js") == rel
+
+    # Different names with identical prefixes may not overwrite each other.
+    alternate = f"https://3dp.rocks/lithophane/{token[:-1]}Z.js"
+    other = engine._destination(alternate, "js")
+    assert other != rel
+
+    (engine.root / "lithophane").mkdir(exist_ok=True)
+    (engine.root / "lithophane/index.html").write_text("<title>Lithophane</title>")
+    engine._write_routes()
+    host = MirrorServer(library)
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    try:
+        host.start(record, port)
+        response = requests.get(f"http://127.0.0.1:{port}/lithophane/{token}.js", timeout=5)
+        assert response.status_code == 200
+        assert response.content == payload
+        assert "javascript" in response.headers["Content-Type"]
+    finally:
+        host.stop()
+
+
+def test_deep_paths_are_flattened_and_queries_remain_distinct(tmp_path):
+    engine = MirrorEngine(MirrorLibrary(tmp_path / "data"))
+    engine.origin = ("https", "3dp.rocks")
+    engine.scope = "/lithophane/"
+    many_dirs = "/".join(["many-characters-" + ("x" * 52)] * 6)
+    base = f"https://3dp.rocks/lithophane/{many_dirs}/viewer.js"
+    first = engine._destination(base + "?id=1", "js")
+    second = engine._destination(base + "?id=2", "js")
+    assert len(first.as_posix()) <= 160
+    assert all(len(part) <= 96 for part in first.parts)
+    assert first != second
+    assert first.suffix == second.suffix == ".js"
+    assert first.parts[0] == "_webmirror_longpaths"
+
+
+def test_windows_reserved_names_are_safe(tmp_path):
+    engine = MirrorEngine(MirrorLibrary(tmp_path / "data"))
+    engine.origin = ("https", "example.org")
+    assert engine._destination("https://example.org/CON.txt", "text/plain").name == "_CON.txt"
+    assert engine._destination("https://example.org/COM1.js", "js").name == "_COM1.js"
