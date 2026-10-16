@@ -33,7 +33,7 @@ USER_AGENT = "WebMirror/0.1 (local static website archiver)"
 CSS_URL = re.compile(r"""url\(\s*(?P<q>['"]?)(?P<url>[^'")]+)(?P=q)\s*\)""", re.I)
 CSS_IMPORT = re.compile(r"""(@import\s+)(?P<q>['"])(?P<url>[^'"]+)(?P=q)""", re.I)
 JS_LITERAL = re.compile(
-    r"""(?P<prefix>\b(?:import|export)\s+(?:[^\n;]{0,200}?\s+from\s*)?|\bimport\s*\(\s*|\bnew\s+URL\s*\(\s*|\bfetch\s*\(\s*)(?P<q>['"])(?P<url>[^'"]+)(?P=q)""",
+    r"""(?P<prefix>\b(?:import|export)\s+(?:[^\n;]{0,200}?\s+from\s*)?|\bimport\s*\(\s*|\bnew\s+URL\s*\(\s*|\bfetch\s*\(\s*|\bnew\s+(?:Worker|SharedWorker)\s*\(\s*)(?P<q>['"])(?P<url>[^'"]+)(?P=q)""",
     re.M,
 )
 SKIP_PREFIXES = ("data:", "blob:", "javascript:", "mailto:", "tel:", "about:", "#", "//#")
@@ -124,11 +124,13 @@ class MirrorEngine:
     """Download linked resources into a folder and rewrite URLs for local hosting."""
 
     def __init__(self, library: MirrorLibrary, progress: Callable[[str], None] | None = None,
-                 max_files: int = MAX_FILES, max_bytes: int = MAX_BYTES):
+                 max_files: int = MAX_FILES, max_bytes: int = MAX_BYTES,
+                 include_pages_files: bool = False):
         self.library = library
         self.progress = progress or (lambda message: None)
         self.max_files = max_files
         self.max_bytes = max_bytes
+        self.include_pages_files = include_pages_files
 
     def mirror(self, supplied_url: str) -> MirrorRecord:
         url = normalize_url(supplied_url)
@@ -140,6 +142,8 @@ class MirrorEngine:
         self.in_progress: set[str] = set()
         self.failures: list[str] = []
         self.pages = 0
+        self.html_paths: set[str] = set()
+        self.extra_files = 0
         self.root = Path(tempfile.mkdtemp(prefix=".webmirror-", dir=self.library.directory))
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT})
@@ -150,10 +154,12 @@ class MirrorEngine:
             entry = self._download(url, hint="html")
             if not entry:
                 raise RuntimeError("The website entry page could not be downloaded.")
+            if self.include_pages_files:
+                self._download_github_pages_assets(url)
             record = MirrorRecord(
                 key=key, url=url, entry=entry,
                 saved_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                files=sum(bool(item) for item in self.visited.values()),
+                files=len({item for item in self.visited.values() if item}) + self.extra_files,
                 pages=self.pages, failures=len(self.failures),
             )
             (self.root / "manifest.json").write_text(
@@ -178,6 +184,97 @@ class MirrorEngine:
             self.session.close()
             if self.root.exists():
                 shutil.rmtree(self.root, ignore_errors=True)
+
+    def _download_github_pages_assets(self, url: str) -> None:
+        """Optionally include unreferenced published files from a public GitHub Pages repo.
+
+        Useful for sites with computed tile names (for instance Terrain Press).
+        This is opt-in because repositories can contain hundreds of megabytes of data.
+        """
+        parsed = urlsplit(url)
+        hostname = (parsed.hostname or "").lower()
+        if not hostname.endswith(".github.io"):
+            self.progress("Full-site asset mode only applies to github.io sites.")
+            return
+        owner = hostname.removesuffix(".github.io")
+        components = [part for part in parsed.path.split("/") if part]
+        if components:
+            repo = components[0]
+            if len(components) > 1 and components[1] != "index.html":
+                self.progress("Full-site asset mode requires a GitHub Pages project homepage.")
+                return
+        else:
+            repo = owner + ".github.io"
+        self.progress(f"Looking up published files in GitHub repo {owner}/{repo}...")
+        api = f"https://api.github.com/repos/{owner}/{repo}"
+        try:
+            metadata = self.session.get(api, timeout=(5, 25),
+                                        headers={"Accept": "application/vnd.github+json"})
+            metadata.raise_for_status()
+            branch = metadata.json()["default_branch"]
+            tree_result = self.session.get(
+                f"{api}/git/trees/{quote(branch, safe='')}?recursive=1",
+                timeout=(5, 45), headers={"Accept": "application/vnd.github+json"}
+            )
+            tree_result.raise_for_status()
+            tree_data = tree_result.json()
+            tree = tree_data["tree"]
+            paths = {item["path"] for item in tree if item.get("type") == "blob"}
+            # Common GitHub Pages publication layouts. Source-build outputs may
+            # not be committed to the repo, in which case regular crawling wins.
+            prefix = next((candidate for candidate in ("site/", "docs/", "")
+                           if candidate + "index.html" in paths), None)
+            if prefix is None:
+                self.progress("No published index.html found in the GitHub repo.")
+                return
+            files = [item for item in tree if item.get("type") == "blob"
+                     and item["path"].startswith(prefix)]
+            if tree_data.get("truncated"):
+                self.progress("GitHub returned a truncated tree; some assets may be missing.")
+            self.progress(f"Found {len(files)} published files in {owner}/{repo}/{prefix}.")
+        except (requests.RequestException, KeyError, ValueError, TypeError) as exc:
+            self.failures.append(f"GitHub Pages file listing unavailable: {exc}")
+            self.progress(f"Could not list GitHub Pages files: {exc}")
+            return
+
+        for index, item in enumerate(files, start=1):
+            if self.extra_files + len(self.visited) >= self.max_files:
+                self.failures.append("GitHub Pages file limit reached")
+                self.progress("File limit reached while copying GitHub Pages assets.")
+                break
+            relative = item["path"][len(prefix):]
+            if not relative:
+                continue
+            source_url = urlunsplit((parsed.scheme, parsed.netloc,
+                                   self.scope + relative, "", ""))
+            kind = "html" if relative.endswith((".html", ".htm")) else ""
+            dest = self.root / self._destination(source_url, kind)
+            if dest.is_file():
+                continue
+            # Defensive check against unexpected upstream repository paths.
+            if not dest.resolve().is_relative_to(self.root.resolve()):
+                continue
+            if item.get("size", 0) > self.max_bytes:
+                self.failures.append(f"{relative}: exceeds per-file size limit")
+                continue
+            raw = (f"https://raw.githubusercontent.com/{owner}/{repo}/"
+                   f"{quote(branch, safe='/')}/{quote(item['path'], safe='/')}")
+            try:
+                with self.session.get(raw, timeout=(5, 35), stream=True) as response:
+                    response.raise_for_status()
+                    data = bytearray()
+                    for chunk in response.iter_content(chunk_size=65536):
+                        data.extend(chunk)
+                        if len(data) > self.max_bytes:
+                            raise ValueError("resource exceeds per-file size limit")
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(data)
+                self.extra_files += 1
+                if index % 10 == 0:
+                    self.progress(f"GitHub Pages assets: {index}/{len(files)} checked...")
+            except (requests.RequestException, ValueError, OSError) as exc:
+                self.failures.append(f"{relative}: {exc}")
+                self.progress(f"Skipped GitHub Pages file {relative}: {exc}")
 
     @staticmethod
     def _supported(url: str) -> bool:
@@ -274,7 +371,9 @@ class MirrorEngine:
                     charset = response.encoding or "utf-8"
                     text = bytes(data).decode(charset, errors="replace")
                     if kind == "html":
-                        self.pages += 1
+                        if local not in self.html_paths:
+                            self.html_paths.add(local)
+                            self.pages += 1
                         text = self._rewrite_html(text, target)
                     elif kind == "css":
                         text = self._rewrite_css(text, target)
@@ -325,9 +424,19 @@ class MirrorEngine:
             is_import = re.match(r"^\s*(import|export)\b", match["prefix"]) is not None
             if is_import and not (link.startswith((".", "/", "http://", "https://"))):
                 return match[0]
-            hint = "js" if is_import or match["prefix"].lstrip().startswith("import(") else ""
+            hint = ("js" if (is_import or match["prefix"].lstrip().startswith("import(")
+                             or "Worker" in match["prefix"]) else "")
             return match["prefix"] + match["q"] + self._replace_link(base, link, hint=hint) + match["q"]
-        return JS_LITERAL.sub(replace, text)
+        text = JS_LITERAL.sub(replace, text)
+        # Worker importScripts() can contain multiple comma-separated file names.
+        def scripts(match: re.Match) -> str:
+            args = re.sub(
+                r"""(?P<q>['"])(?P<url>[^'"]+)(?P=q)""",
+                lambda item: item["q"] + self._replace_link(base, item["url"], hint="js") + item["q"],
+                match["args"],
+            )
+            return "importScripts(" + args + ")"
+        return re.sub(r"\bimportScripts\s*\((?P<args>[^)]*)\)", scripts, text)
 
     def _rewrite_manifest(self, text: str, base: str) -> str:
         try:

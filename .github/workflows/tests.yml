@@ -13,4 +13,5 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install -e '.[test]'
+      - run: python -m compileall -q webmirror
       - run: python -m pytest -q

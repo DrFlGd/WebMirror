@@ -24,6 +24,7 @@ class WebMirrorApp:
         self.busy = False
         self.url = tk.StringVar()
         self.port = tk.StringVar(value="8000")
+        self.full_assets = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Ready to mirror a website.")
         self.site_details = tk.StringVar(value="Choose a saved website.")
         self.host_status = tk.StringVar(value="Local server stopped.")
@@ -58,6 +59,12 @@ class WebMirrorApp:
         self.mirror_button.grid(row=0, column=1)
         ttk.Label(download_box, text="Example: https://ianbauters.github.io/terrain-press/",
                   style="Note.TLabel").grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.full_checkbox = ttk.Checkbutton(
+            download_box,
+            text="GitHub Pages: include all published repository files (may be a large download)",
+            variable=self.full_assets,
+        )
+        self.full_checkbox.grid(row=2, column=0, columnspan=2, sticky="w", pady=(7, 0))
 
         library_box = ttk.LabelFrame(panel, text="2 · Saved websites", padding=12)
         library_box.grid(row=2, column=0, sticky="nsew", pady=(0, 12))
@@ -140,6 +147,7 @@ class WebMirrorApp:
     def _controls(self) -> None:
         self.mirror_button.configure(state="disabled" if self.busy else "normal")
         self.url_entry.configure(state="disabled" if self.busy else "normal")
+        self.full_checkbox.configure(state="disabled" if self.busy else "normal")
         can_select = self.selected() is not None and not self.busy
         self.host_button.configure(state="normal" if can_select else "disabled")
         self.delete_button.configure(state="normal" if can_select else "disabled")
@@ -157,11 +165,15 @@ class WebMirrorApp:
         self.busy = True
         self.status.set("Downloading website...")
         self._write_log(f"Starting: {url}")
+        include_pages_files = self.full_assets.get()
         self._controls()
 
         def worker() -> None:
             try:
-                result = MirrorEngine(self.library, progress=lambda msg: self.queue.put(("log", msg))).mirror(url)
+                result = MirrorEngine(
+                    self.library, progress=lambda msg: self.queue.put(("log", msg)),
+                    include_pages_files=include_pages_files,
+                ).mirror(url)
                 self.queue.put(("done", result))
             except Exception as exc:
                 self.queue.put(("error", str(exc)))

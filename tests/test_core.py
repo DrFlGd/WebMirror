@@ -120,3 +120,71 @@ def test_resource_limit_is_reported(origin, tmp_path):
     assert record.files <= 2
     assert record.failures >= 1
     assert (library.path(record) / "demo/index.html").is_file()
+
+
+def test_opt_in_full_assets_mode_ignored_for_non_github(origin, tmp_path):
+    library = MirrorLibrary(tmp_path / "other")
+    record = MirrorEngine(library, include_pages_files=True).mirror(origin)
+    assert record.files >= 8
+    assert record.failures == 0
+
+
+def test_github_pages_full_asset_capture_with_mock_api(tmp_path):
+    """Computed tile filenames are copied even without a literal HTML/JS link."""
+    import json
+    import requests
+
+    library = MirrorLibrary(tmp_path / "data")
+    engine = MirrorEngine(library, include_pages_files=True)
+    engine.origin = ("https", "demo.github.io")
+    engine.scope = "/example/"
+    engine.root = tmp_path / "snapshot"
+    (engine.root / "example").mkdir(parents=True)
+    (engine.root / "example/index.html").write_text("<h1>Existing page</h1>")
+    engine.session = requests.Session()
+    engine.visited = {"https://demo.github.io/example/": "/example/index.html"}
+    engine.failures = []
+    engine.extra_files = 0
+
+    class Response:
+        def __init__(self, obj=None, body=b""):
+            self.obj, self.body = obj, body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self.obj
+
+        def iter_content(self, chunk_size):
+            yield self.body
+
+    def get(url, **kwargs):
+        if url == "https://api.github.com/repos/demo/example":
+            return Response({"default_branch": "main"})
+        if "/git/trees/main?" in url:
+            return Response({"tree": [
+                {"path": "site/index.html", "type": "blob", "size": 22},
+                {"path": "site/data/tile_00.webp", "type": "blob", "size": 6},
+                {"path": "site/lib/app.js", "type": "blob", "size": 4},
+            ]})
+        if url.endswith("site/data/tile_00.webp"):
+            return Response(body=b"tile00")
+        if url.endswith("site/lib/app.js"):
+            return Response(body=b"code")
+        raise AssertionError(f"Unexpected request: {url}")
+
+    engine.session.get = get
+    engine._download_github_pages_assets("https://demo.github.io/example/")
+    assert (engine.root / "example/data/tile_00.webp").read_bytes() == b"tile00"
+    assert (engine.root / "example/lib/app.js").read_bytes() == b"code"
+    assert (engine.root / "example/index.html").read_text() == "<h1>Existing page</h1>"
+    assert engine.extra_files == 2
+    assert engine.failures == []
+    engine.session.close()
