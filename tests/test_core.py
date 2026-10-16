@@ -90,7 +90,7 @@ def test_mirror_nested_assets_and_local_host(origin, tmp_path):
         port = sock.getsockname()[1]
     try:
         url = host.start(record, port=port)
-        assert url.endswith("/demo/index.html")
+        assert url.endswith("/demo/")
         page = requests.get(url, timeout=3)
         assert page.status_code == 200 and "Demo" in page.text
         js_page = requests.get(f"http://127.0.0.1:{port}/demo/js/module.js", timeout=3)
@@ -188,3 +188,115 @@ def test_github_pages_full_asset_capture_with_mock_api(tmp_path):
     assert engine.extra_files == 2
     assert engine.failures == []
     engine.session.close()
+
+
+
+def test_spa_path_without_slash_and_client_route_fallback(tmp_path):
+    """Original /app must render directly, without redirecting to /app/."""
+    from datetime import datetime, timezone
+    from webmirror.core import MirrorRecord
+
+    library = MirrorLibrary(tmp_path / "data")
+    record = MirrorRecord(
+        key="single-page-a12b34c56def",
+        url="https://example.org/app",
+        entry="/app/index.html",
+        saved_at=datetime.now(timezone.utc).isoformat(),
+        files=2, pages=1, failures=0,
+    )
+    folder = library.path(record)
+    (folder / "app").mkdir(parents=True)
+    (folder / "app/index.html").write_text("<title>SPA App</title>")
+    (folder / "app/assets.js").write_text("window.app = 1;")
+    (folder / ".webmirror-routes.json").write_text(
+        '{"' + '/app' + '": "/app/index.html"}'
+    )
+
+    server = MirrorServer(library)
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    try:
+        assert server.start(record, port).endswith("/app")
+        root = f"http://127.0.0.1:{port}"
+        page = requests.get(root + "/app", timeout=3, allow_redirects=False)
+        assert page.status_code == 200
+        assert "<title>SPA App</title>" in page.text
+        assert "text/html" in page.headers["Content-Type"]
+        nested = requests.get(root + "/app/editor", headers={"Accept": "text/html"}, timeout=3)
+        assert nested.status_code == 200 and "SPA App" in nested.text
+        missing_js = requests.get(root + "/app/missing.js", timeout=3)
+        assert missing_js.status_code == 404
+        javascript = requests.get(root + "/app/assets.js", timeout=3)
+        assert javascript.status_code == 200 and "window.app" in javascript.text
+    finally:
+        server.stop()
+
+
+def test_dynamic_capture_preserves_query_parameter_asset_urls(tmp_path):
+    """A JS-created fetch('/data?...') resolves to its exact captured data."""
+    from datetime import datetime, timezone
+    from webmirror.core import MirrorRecord
+
+    library = MirrorLibrary(tmp_path / "data")
+    engine = MirrorEngine(library)
+    engine.root = tmp_path / "capture"
+    engine.root.mkdir()
+    engine.visited = {}
+    engine.in_progress = set()
+    engine.failures = []
+    engine.pages = 0
+    engine.html_paths = set()
+    engine.origin = ("https", "example.org")
+    engine.scope = "/"
+    url = "https://example.org/api/data?world=mars&tile=2"
+    assert engine._store_browser_asset(url, "application/json", b'{"elevation":42}')
+    engine._write_routes()
+
+    from urllib.parse import urlsplit
+    from pathlib import Path
+    import json
+    routes = json.loads((engine.root / ".webmirror-routes.json").read_text())
+    assert "/api/data?world=mars&tile=2" in routes
+    archive = engine.root / routes["/api/data?world=mars&tile=2"].lstrip("/")
+    assert json.loads(archive.read_text())["elevation"] == 42
+    record = MirrorRecord(
+        key="example-org-abcdefabcdef", url="https://example.org/",
+        entry="/index.html", saved_at=datetime.now(timezone.utc).isoformat(),
+        files=2, pages=1, failures=0,
+    )
+    destination = library.path(record)
+    destination.mkdir()
+    (engine.root / "index.html").write_text("<h1>App</h1>")
+    import shutil
+    shutil.copytree(engine.root, destination, dirs_exist_ok=True)
+    server = MirrorServer(library)
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    try:
+        server.start(record, port)
+        response = requests.get(f"http://127.0.0.1:{port}/api/data?world=mars&tile=2", timeout=3)
+        assert response.status_code == 200
+        assert response.json() == {"elevation": 42}
+    finally:
+        server.stop()
+
+
+def test_captured_js_chunk_is_written_to_expected_root_path(tmp_path):
+    engine = MirrorEngine(MirrorLibrary(tmp_path / "data"))
+    engine.root = tmp_path / "snapshot"
+    engine.root.mkdir()
+    engine.visited = {}
+    engine.in_progress = set()
+    engine.failures = []
+    engine.pages = 0
+    engine.html_paths = set()
+    engine.origin = ("https", "example.org")
+    engine.scope = "/app/"
+    assert engine._store_browser_asset(
+        "https://example.org/assets/chunk-RANDOM123.js",
+        "application/javascript", b'export const mounted = true;',
+    )
+    assert (engine.root / "assets/chunk-RANDOM123.js").exists()
+    assert engine.visited["https://example.org/assets/chunk-RANDOM123.js"] == "/assets/chunk-RANDOM123.js"
