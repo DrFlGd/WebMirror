@@ -110,3 +110,33 @@ jobs:
           path: dist/WebMirror-Linux.tar.gz
           if-no-files-found: error
           retention-days: 90
+
+  # Artifacts expire after 90 days and need a GitHub login to download; a release does
+  # neither, so Generator Library (and the README link) can point at a permanent download.
+  # One release per push to main, tagged build-<run number>, with all three executables.
+  release:
+    name: Publish release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: downloads
+          merge-multiple: true
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: WebMirror build ${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          files: |
+            downloads/WebMirror.exe
+            downloads/WebMirror-macOS.zip
+            downloads/WebMirror-Linux.tar.gz
+          fail_on_unmatched_files: true
+          body: |
+            Unsigned desktop executables built from ${{ github.sha }}.
+            Windows: run WebMirror.exe. macOS: unzip and open WebMirror.app (use Finder's Open if Gatekeeper blocks it). Linux: extract the tar.gz and run ./WebMirror.

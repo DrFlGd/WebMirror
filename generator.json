@@ -1,0 +1,33 @@
+{
+  "$schema": "https://raw.githubusercontent.com/DrFlGd/Generator-Library/main/schema/generator.schema.json",
+  "id": "webmirror",
+  "name": "WebMirror",
+  "summary": "Save public static websites and serve them locally. Generator Library uses it to mirror web generators for offline use.",
+  "tags": ["tool", "offline"],
+  "process": "tool",
+  "distributions": [
+    {
+      "kind": "exe",
+      "platform": "windows",
+      "install": "portable",
+      "label": "Install for Windows",
+      "from": { "type": "release", "tag": "build-*", "asset": "WebMirror.exe" }
+    },
+    {
+      "kind": "exe",
+      "platform": "macos",
+      "install": "zip",
+      "exec": "WebMirror.app",
+      "label": "Install for macOS",
+      "from": { "type": "release", "tag": "build-*", "asset": "WebMirror-macOS.zip" }
+    },
+    {
+      "kind": "exe",
+      "platform": "linux",
+      "install": "zip",
+      "exec": "WebMirror",
+      "label": "Install for Linux",
+      "from": { "type": "release", "tag": "build-*", "asset": "WebMirror-Linux.tar.gz" }
+    }
+  ]
+}
