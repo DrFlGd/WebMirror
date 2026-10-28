@@ -51,7 +51,6 @@ def visit(page_url, label):
     print("TEXT", text)
 
 
-visit(URL, "LIVE")
 home = Path(tempfile.mkdtemp())
 lib = MirrorLibrary(home)
 eng = MirrorEngine(lib, progress=lambda m: print("PROGRESS", m[:200]), browser_capture=True)
@@ -66,6 +65,12 @@ routes = folder / ".webmirror-routes.json"
 if routes.is_file():
     for k, v in list(json.loads(routes.read_text("utf-8")).items())[:200]:
         print("ROUTE", k[:200], "->", v)
+import re as _re
+for f in files:
+    if f.endswith((".js", ".html")):
+        t = (folder / f).read_text("utf-8", "replace")
+        for m in _re.finditer(r"huggingface|\.onnx|transformers|onnxruntime|ormbg|jsdelivr|unpkg|esm\.sh|caches\.open|indexedDB|localModelPath|remoteHost|allowLocalModels|wasmPaths", t):
+            print("GREP", f, t[max(0, m.start()-160):m.end()+160].replace("\n", " "))
 srv = MirrorServer(lib)
 local = srv.start(rec, port=8765)
 visit(local, "MIRROR")
