@@ -1,18 +1,61 @@
-import re, requests
-H = {"User-Agent": "Mozilla/5.0"}
-raw = requests.get("https://miniskyline.com/desktop", headers=H, timeout=20).text
-for s in re.findall(r'src="([^"]+\.js)"', raw) + re.findall(r'href="([^"]+\.js)"', raw):
-    js = requests.get("https://miniskyline.com" + s, headers=H, timeout=30).text
-    print("SCRIPT", s, len(js))
-    for m in re.finditer(r"setup\.exe|AppImage|mac-arm64|MiniSkylines-Desktop|downloads/desktop|desktopVersion|DESKTOP_VERSION", js):
-        print("CTX", s[-30:], js[max(0, m.start()-300):m.end()+200].replace("\n", " "))
-    imports = set(re.findall(r'["\'](\./[^"\']+\.js|/assets/[^"\']+\.js)["\']', js))
-    print("IMPORTS", len(imports), sorted(imports)[:80])
-    for imp in sorted(imports):
-        path = imp if imp.startswith("/") else "/assets/" + imp[2:]
-        sub = requests.get("https://miniskyline.com" + path, headers=H, timeout=30).text
-        for m in re.finditer(r"setup\.exe|MiniSkylines-Desktop|downloads/desktop", sub):
-            print("SUBCTX", path, sub[max(0, m.start()-400):m.end()+250].replace("\n", " "))
-for path in ("/downloads/desktop/MiniSkylines-Desktop-1.511-setup.exe", "/version.json", "/api/desktop-version", "/desktop.json"):
-    r = requests.head("https://miniskyline.com" + path, headers=H, timeout=20, allow_redirects=False)
-    print("HEAD", path, r.status_code, {k: v for k, v in r.headers.items() if k.lower() in ("content-type", "content-length", "location", "etag", "last-modified")})
+import json, sys, tempfile, collections
+from pathlib import Path
+from urllib.parse import urlsplit
+from playwright.sync_api import sync_playwright
+from webmirror.core import MirrorEngine, MirrorLibrary, MirrorServer
+
+URL = sys.argv[1]
+
+
+def visit(page_url, label):
+    hosts = collections.Counter()
+    failed, errors, reqs = [], [], []
+    with sync_playwright() as p:
+        b = p.chromium.launch()
+        pg = b.new_page()
+        pg.on("console", lambda m: errors.append(f"{m.type}: {m.text}"[:400]) if m.type in ("error", "warning") else None)
+        pg.on("pageerror", lambda e: errors.append(f"PAGEERROR {e}"[:600]))
+        pg.on("requestfailed", lambda r: failed.append(f"{r.method} {r.url[:200]} {r.failure}"))
+
+        def resp(r):
+            hosts[urlsplit(r.url).netloc] += 1
+            reqs.append(f"{r.status} {r.request.method} {r.request.resource_type} {r.url[:220]}")
+
+        pg.on("response", resp)
+        try:
+            pg.goto(page_url, wait_until="networkidle", timeout=90000)
+        except Exception as e:
+            print("GOTO", e)
+        pg.wait_for_timeout(8000)
+        text = pg.inner_text("body")[:1500].replace("\n", " | ")
+        b.close()
+    print(f"===== {label} {page_url}")
+    print("HOSTS", dict(hosts))
+    for r in reqs:
+        print("REQ", r)
+    for f in failed:
+        print("FAILED", f)
+    for e in errors:
+        print("CONSOLE", e)
+    print("TEXT", text)
+
+
+visit(URL, "LIVE")
+home = Path(tempfile.mkdtemp())
+lib = MirrorLibrary(home)
+eng = MirrorEngine(lib, progress=lambda m: print("PROGRESS", m[:200]), browser_capture=True)
+rec = eng.mirror(URL)
+folder = lib.path(rec)
+print("RECORD", json.dumps(rec.__dict__))
+files = sorted(str(x.relative_to(folder)) for x in folder.rglob("*") if x.is_file())
+print("FILES", len(files))
+for f in files:
+    print("FILE", f, (folder / f).stat().st_size)
+routes = folder / ".webmirror-routes.json"
+if routes.is_file():
+    for k, v in list(json.loads(routes.read_text("utf-8")).items())[:200]:
+        print("ROUTE", k[:200], "->", v)
+srv = MirrorServer(lib)
+local = srv.start(rec, port=8765)
+visit(local, "MIRROR")
+srv.stop()
