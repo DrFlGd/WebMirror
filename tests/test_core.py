@@ -571,3 +571,43 @@ def test_url_prefix_joined_at_run_time_is_left_alone(tmp_path):
     js = 'fetch("/tools/" + name + ".wasm"); fetch("/tools/")'
     out = engine._rewrite_js(js, "https://example.org/app.js")
     assert out == 'fetch("/tools/" + name + ".wasm"); fetch("/tools/index.html")'
+
+
+def test_folder_address_without_trailing_slash_mirrors_that_folder(origin, tmp_path):
+    """"/demo" redirects to "/demo/": its relative links and scope follow the folder."""
+    library = MirrorLibrary(tmp_path / "data")
+    record = MirrorEngine(library).mirror(origin.rstrip("/"))
+    folder = library.path(record)
+    html = (folder / "demo/index.html").read_text()
+    assert record.entry == "/demo/index.html"
+    assert record.pages == 2
+    assert record.failures == 0
+    assert 'href="/demo/about.html#top"' in html
+    assert 'href="/demo/styles/main.css"' in html
+    assert not (folder / "other.html").exists()
+
+
+def test_entry_saved_by_the_browser_after_a_redirect_is_found(tmp_path):
+    """A site that refuses plain requests and redirects "/tools" to "/tools/"."""
+    from unittest.mock import patch
+
+    class NotFound:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def raise_for_status(self):
+            raise requests.HTTPError("404 Client Error: Not Found")
+
+    def fake_capture(url, **kwargs):
+        return [("https://example.org/tools/", "text/html", b"<html><body>Tools</body></html>")]
+
+    library = MirrorLibrary(tmp_path / "data")
+    with patch("requests.Session.get", return_value=NotFound()), patch(
+        "webmirror.browser.capture_public_assets", side_effect=fake_capture
+    ):
+        record = MirrorEngine(library, browser_capture=True).mirror("https://example.org/tools")
+    assert record.entry == "/tools/index.html"
+    assert "Tools" in (library.path(record) / "tools/index.html").read_text()

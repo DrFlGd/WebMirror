@@ -153,7 +153,16 @@ class MirrorEngine:
         parsed = urlsplit(url)
         self.origin = (parsed.scheme.lower(), parsed.netloc.lower())
         path = parsed.path or "/"
-        self.scope = path if path.endswith("/") else posixpath.dirname(path) + "/"
+        # "/designer" is a folder on most sites (it redirects to "/designer/"), so
+        # scope the crawl to it rather than to the whole site; "/app/page.html"
+        # keeps its folder "/app/".
+        if path.endswith("/"):
+            self.scope = path
+        elif PurePosixPath(path).suffix:
+            self.scope = posixpath.dirname(path) + "/"
+        else:
+            self.scope = path + "/"
+        self.entry_path = path
         self.visited: dict[str, str | None] = {}
         self._browser_assets: dict[str, tuple[str, bytes]] = {}
         self.in_progress: set[str] = set()
@@ -174,7 +183,7 @@ class MirrorEngine:
             entry = self._download(url, hint="html")
             if self.browser_capture:
                 self._capture_browser(url)
-                entry = self.visited.get(url) or entry
+                entry = self._visited_variant(url) or entry
             if not entry:
                 detail = self.failures[0] if self.failures else "Unknown error"
                 raise RuntimeError(
@@ -246,6 +255,14 @@ class MirrorEngine:
                 added += 1
         self._browser_assets.clear()
         self.progress(f"Captured {added} additional dynamic resources.")
+
+    def _visited_variant(self, url: str) -> str | None:
+        """The saved copy of `url`, or of its trailing-slash twin it redirected to."""
+        parts = urlsplit(url)
+        path = parts.path or "/"
+        twin = path[:-1] if path.endswith("/") and path != "/" else path + "/"
+        return (self.visited.get(url)
+                or self.visited.get(urlunsplit((parts.scheme, parts.netloc, twin, parts.query, ""))))
 
     def _known_pages(self, entry: str) -> list[str]:
         """In-scope pages found so far, for the browser to open after the entry."""
@@ -453,8 +470,9 @@ class MirrorEngine:
 
     def _within_scope(self, target: str) -> bool:
         p = urlsplit(target)
+        path = p.path or "/"
         return ((p.scheme.lower(), p.netloc.lower()) == self.origin
-                and (p.path or "/").startswith(self.scope))
+                and (path.startswith(self.scope) or path == getattr(self, "entry_path", None)))
 
     def _destination(self, target: str, kind: str) -> Path:
         parts = urlsplit(target)
@@ -562,6 +580,14 @@ class MirrorEngine:
                 local = "/" + rel.as_posix()
                 # Mark as cached before recursive processing to break asset cycles.
                 self.visited[target] = local
+                # After a redirect ("/designer" to "/designer/") relative links
+                # resolve against where the page really is, as in a browser.
+                final = (getattr(response, "url", None) or target).split("#", 1)[0]
+                if final != target:
+                    final_parts = urlsplit(final)
+                    if (final_parts.scheme.lower(), final_parts.netloc.lower()) == self.origin:
+                        self.visited.setdefault(final, local)
+                base = final
                 if kind in ("html", "css", "js", "manifest"):
                     charset = response.encoding or "utf-8"
                     text = bytes(data).decode(charset, errors="replace")
@@ -573,13 +599,13 @@ class MirrorEngine:
                         if local not in self.html_paths:
                             self.html_paths.add(local)
                             self.pages += 1
-                        text = self._rewrite_html(text, target)
+                        text = self._rewrite_html(text, base)
                     elif kind == "css":
-                        text = self._rewrite_css(text, target)
+                        text = self._rewrite_css(text, base)
                     elif kind == "js":
-                        text = self._rewrite_js(text, target)
+                        text = self._rewrite_js(text, base)
                     elif kind == "manifest":
-                        text = self._rewrite_manifest(text, target)
+                        text = self._rewrite_manifest(text, base)
                     data = bytearray(text.encode("utf-8"))
                 filename = self.root / rel
                 filename.parent.mkdir(parents=True, exist_ok=True)
