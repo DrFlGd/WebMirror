@@ -1,27 +1,23 @@
-import sys, re, json
+import re, requests
 from playwright.sync_api import sync_playwright
-url = sys.argv[1]
+H = {"User-Agent": "Mozilla/5.0"}
+raw = requests.get("https://miniskyline.com/desktop", headers=H, timeout=20)
+print("RAW", raw.status_code, len(raw.text), sorted(set(re.findall(r"downloads/desktop/[^\"'\s<>]+", raw.text)))[:20])
+scripts = re.findall(r'src="([^"]+\.js)"', raw.text)
+print("SCRIPTS", scripts[:20])
+for s in scripts:
+    js = requests.get(requests.compat.urljoin("https://miniskyline.com/desktop", s), headers=H, timeout=20).text
+    for m in set(re.findall(r"[^\"'`\s]{0,80}downloads/desktop[^\"'`\s]{0,120}|[^\"'`\s]{0,60}latest[^\"'`\s]{0,60}\.json", js)):
+        print("JS_REF", s[-40:], m)
+for path in ("/downloads/desktop/", "/downloads/desktop/latest.json", "/downloads/desktop/latest", "/api/desktop/latest", "/api/desktop", "/api/desktop/version", "/downloads/desktop/version.json", "/desktop/latest.json", "/api/version"):
+    r = requests.get("https://miniskyline.com" + path, headers=H, timeout=20, allow_redirects=False)
+    print("TRY", path, r.status_code, r.headers.get("content-type"), r.text[:300].replace("\n", " "))
 with sync_playwright() as p:
-    b = p.chromium.launch(); page = b.new_page(); log = []
-    page.on("response", lambda r: log.append((r.status, r.request.resource_type, r.url[:250], r.headers.get("content-type", ""))))
-    page.goto(url, wait_until="networkidle", timeout=60000); page.wait_for_timeout(3000)
-    print("TEXT", page.locator("body").inner_text()[:3000].replace("\n", " | "))
-    links = page.eval_on_selector_all("a[href]", "els => els.map(e => [e.innerText.trim().slice(0,60), e.href, e.getAttribute('download')])")
-    for l in links:
-        if not re.match(r"https://miniskyline.com/[a-z-]*$", l[1]): print("LINK", l)
-    buttons = page.eval_on_selector_all("button", "els => els.map(e => e.innerText.trim().slice(0,60))")
-    print("BUTTONS", buttons[:40])
-    for x in log:
-        if x[1] in ("fetch", "xhr") or "json" in x[3] or re.search(r"\.(exe|msi|dmg|AppImage|gz|zip)\b", x[2]): print("REQ", x)
-    for host in sorted({re.sub(r"^https?://([^/]+).*", r"\1", x[2]) for x in log}): print("HOST", host)
-    # Click download-looking buttons and capture the download URL without saving.
-    for label in ("Windows", "Download", "macOS", "Linux", "AppImage"):
-        for el in page.get_by_text(label, exact=False).all()[:4]:
-            try:
-                with page.expect_download(timeout=4000) as d:
-                    el.click(timeout=2000)
-                print("DOWNLOAD", label, d.value.url, d.value.suggested_filename); d.value.cancel()
-            except Exception as exc:
-                pass
-    print("REQS_AFTER", [x for x in log if re.search(r"\.(exe|msi|dmg|AppImage|gz|zip|json)\b", x[2])][:30])
+    b = p.chromium.launch(); page = b.new_page()
+    page.goto("https://miniskyline.com/desktop", wait_until="networkidle", timeout=60000)
+    for tab in ("Windows", "Mac", "Linux"):
+        page.get_by_role("button", name=tab, exact=True).click(); page.wait_for_timeout(800)
+        links = page.eval_on_selector_all("a[href*='downloads']", "els => els.map(e => [e.innerText.trim().slice(0,50), e.href])")
+        print("TAB", tab, links)
+        print("TABTEXT", tab, re.findall(r"Version[^|]{0,120}", page.locator("body").inner_text().replace("\n", " | "))[:2])
     b.close()
