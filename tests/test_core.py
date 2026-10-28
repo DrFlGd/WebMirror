@@ -490,3 +490,84 @@ def test_failed_browser_verification_does_not_replace_existing_snapshot(origin, 
 
     assert (library.path(record) / "demo/index.html").read_bytes() == original
     assert library.list() == [record]
+
+
+def test_browser_opens_linked_pages_the_static_crawl_could_not_fetch(tmp_path):
+    """Tool pages a site refuses to plain requests are saved from the browser."""
+    from unittest.mock import patch
+
+    library = MirrorLibrary(tmp_path / "data")
+    source = "https://example.org/designer/"
+    hub = (b'<html><body><a href="/designer/keychain/">Keychain</a>'
+           b'<a href="https://example.org/designer/tag/">Tag</a>'
+           b'<a href="/designer/manual.pdf">Manual</a><a href="/shop/">Shop</a></body></html>')
+    seen = {}
+
+    class Response:
+        encoding = "utf-8"
+
+        def __init__(self, url):
+            self.url = url
+            self.headers = {"Content-Type": "text/html"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def raise_for_status(self):
+            if self.url != source:
+                raise requests.HTTPError("403 Forbidden")
+
+        def iter_content(self, chunk_size):
+            yield hub
+
+    def fake_capture(url, *, pages, follow, max_pages, **kwargs):
+        seen.update(pages=list(pages), follow=follow, max_pages=max_pages)
+        return [
+            ("https://example.org/designer/keychain/", "text/html",
+             b'<html><head><script src="engine.js"></script></head><body>Keychain tool</body></html>'),
+            ("https://example.org/designer/keychain/engine.js", "application/javascript", b"run();"),
+        ]
+
+    with patch("requests.Session.get", side_effect=lambda url, **kw: Response(url)), patch(
+        "webmirror.browser.capture_public_assets", side_effect=fake_capture
+    ):
+        record = MirrorEngine(library, browser_capture=True, max_pages=12).mirror(source)
+
+    assert seen["max_pages"] == 12
+    assert seen["pages"] == ["https://example.org/designer/keychain/", "https://example.org/designer/tag/"]
+    assert seen["follow"]("https://example.org/designer/other/")
+    assert seen["follow"]("https://example.org/designer/page.html")
+    assert not seen["follow"]("https://example.org/designer/manual.pdf")
+    assert not seen["follow"]("https://example.org/shop/")
+    folder = library.path(record)
+    hub_page = (folder / "designer/index.html").read_text()
+    assert 'href="/designer/keychain/index.html"' in hub_page
+    assert 'href="/designer/tag/index.html"' in hub_page
+    assert 'href="/shop/"' in hub_page
+    assert "Keychain tool" in (folder / "designer/keychain/index.html").read_text()
+    assert (folder / "designer/keychain/engine.js").read_bytes() == b"run();"
+    # Never saved: the link opens the live page instead of a missing file.
+    stub = (folder / "designer/tag/index.html").read_text()
+    assert 'content="0;url=https://example.org/designer/tag/"' in stub
+    assert record.pages == 2
+
+
+def test_link_back_to_a_page_being_saved_points_at_its_local_copy(origin, tmp_path):
+    library = MirrorLibrary(tmp_path / "data")
+    record = MirrorEngine(library).mirror(origin)
+    about = (library.path(record) / "demo/about.html").read_text()
+    assert 'href="/demo/index.html"' in about
+
+
+def test_url_prefix_joined_at_run_time_is_left_alone(tmp_path):
+    engine = MirrorEngine(MirrorLibrary(tmp_path / "data"))
+    engine.origin = ("https", "example.org")
+    engine.scope = "/"
+    engine.visited = {"https://example.org/tools/": "/tools/index.html"}
+    engine.in_progress = set()
+    js = 'fetch("/tools/" + name + ".wasm"); fetch("/tools/")'
+    out = engine._rewrite_js(js, "https://example.org/app.js")
+    assert out == 'fetch("/tools/" + name + ".wasm"); fetch("/tools/index.html")'

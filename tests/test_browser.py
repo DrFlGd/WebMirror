@@ -191,3 +191,87 @@ def test_manual_verification_times_out_without_persisting_challenge(monkeypatch)
             verification_timeout=0,
         )
     assert pw.launched == [True, False]
+
+
+class WalkingPage(FakePage):
+    """A site whose pages link to each other, some links added by script."""
+
+    LINKS = {
+        "https://example.org/tools/": ["https://example.org/tools/a/", "https://example.org/blog/"],
+        "https://example.org/tools/a/": ["https://example.org/tools/b/#top", "https://example.org/tools/"],
+        "https://example.org/tools/b/": ["https://example.org/tools/c/"],
+        "https://example.org/tools/c/": [],
+    }
+
+    def __init__(self):
+        super().__init__(True)
+        self.opened = []
+
+    def goto(self, url, **kwargs):
+        self.url = url
+        self.opened.append(url)
+        response = FakeResponse(url, 200, f"<title>{url}</title>".encode())
+        self.callbacks["response"](response)
+        self.callbacks["response"](FakeResponse(url + "engine.wasm", 200, b"\0asm", "application/wasm"))
+        return response
+
+    def title(self):
+        return "Tool"
+
+    def content(self):
+        return "<html><body>Tool</body></html>"
+
+    def wait_for_timeout(self, duration):
+        pass
+
+    def eval_on_selector_all(self, selector, script):
+        assert selector == "a[href]"
+        return self.LINKS[self.url]
+
+
+def walking_playwright(monkeypatch):
+    playwright = fake_playwright(monkeypatch)
+    page = WalkingPage()
+
+    def launch(*, headless, **kwargs):
+        browser = FakeBrowser(headless)
+        browser.page = page
+        return browser
+
+    playwright.launch = launch
+    return page
+
+
+def test_capture_opens_linked_pages_under_the_follow_rule(monkeypatch):
+    page = walking_playwright(monkeypatch)
+    assets = capture_public_assets(
+        "https://example.org/tools/", max_files=50, max_bytes=1000, progress=lambda m: None,
+        follow=lambda link: link.startswith("https://example.org/tools/"), max_pages=10,
+    )
+    assert page.opened == [
+        "https://example.org/tools/", "https://example.org/tools/a/",
+        "https://example.org/tools/b/", "https://example.org/tools/c/",
+    ]
+    urls = {url for url, _, _ in assets}
+    assert "https://example.org/tools/b/engine.wasm" in urls
+    assert "https://example.org/blog/" not in page.opened
+
+
+def test_capture_stops_at_the_page_limit(monkeypatch):
+    page = walking_playwright(monkeypatch)
+    messages = []
+    capture_public_assets(
+        "https://example.org/tools/", max_files=50, max_bytes=1000, progress=messages.append,
+        pages=["https://example.org/tools/c/"],
+        follow=lambda link: link.startswith("https://example.org/tools/"), max_pages=2,
+    )
+    assert page.opened == ["https://example.org/tools/", "https://example.org/tools/c/"]
+    assert any("Page limit reached" in m for m in messages)
+
+
+def test_capture_without_follow_opens_only_the_entry_page(monkeypatch):
+    page = walking_playwright(monkeypatch)
+    capture_public_assets(
+        "https://example.org/tools/", max_files=50, max_bytes=1000, progress=lambda m: None,
+    )
+    assert page.opened == ["https://example.org/tools/"]

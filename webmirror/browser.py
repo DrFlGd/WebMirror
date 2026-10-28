@@ -8,10 +8,11 @@ use stored account cookies, or archive private browser profiles.
 from __future__ import annotations
 
 from time import monotonic
-from typing import Callable
+from typing import Callable, Iterable
 from urllib.parse import urlsplit
 
-CAPTURE_LIMIT = 160 * 1024 * 1024
+# One capture may now walk many pages of a site, so the byte budget covers them all.
+CAPTURE_LIMIT = 320 * 1024 * 1024
 VERIFICATION_TIMEOUT_SECONDS = 180
 ALLOWED_CONTENT_TYPES = (
     "text/html", "text/css", "text/javascript", "application/javascript",
@@ -89,12 +90,20 @@ def capture_public_assets(
     allow_manual_verification: bool = False,
     on_verification_required: Callable[[str], None] | None = None,
     verification_timeout: int = VERIFICATION_TIMEOUT_SECONDS,
+    pages: Iterable[str] = (),
+    follow: Callable[[str], bool] | None = None,
+    max_pages: int = 1,
 ) -> list[tuple[str, str, bytes]]:
     """Observe anonymous GET responses and optionally invite the user to verify.
 
     When an interstitial is detected, a visible temporary browser opens and
     the user may solve the check manually. This capture never reuses the user's
     signed-in browser profile; closing the window cancels verification.
+
+    After `url`, the same browser opens each of `pages`, then every link a
+    loaded page shows that `follow` accepts, up to `max_pages` pages in all.
+    Links a script adds after load are found this way too, and each page's own
+    on-demand engines, models and fonts are observed as it runs.
     """
     try:
         from playwright.sync_api import sync_playwright
@@ -142,10 +151,10 @@ def capture_public_assets(
         page.on("requestfailed", lambda req: failed.append(req.url[:180]))
         return context, page
 
-    def navigate(page):
+    def navigate(page, target=url):
         response = None
         try:
-            response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            response = page.goto(target, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(1300)
         except Exception as exc:
             progress(f"Browser navigation incomplete: {str(exc)[:150]}")
@@ -160,16 +169,52 @@ def capture_public_assets(
         except Exception as exc:
             progress(f"Browser preview incomplete: {str(exc)[:150]}")
 
+    def links(page) -> list[str]:
+        try:
+            found = page.eval_on_selector_all("a[href]", "els => els.map((e) => e.href)")
+        except Exception:
+            return []
+        return [str(link).split("#", 1)[0] for link in found or [] if isinstance(link, str)]
+
+    queue = [url] + [p.split("#", 1)[0] for p in pages]
+    visited_pages: set[str] = {url}
+
+    def enqueue(found: Iterable[str]) -> None:
+        for link in found:
+            if follow and link not in queue and link not in visited_pages and follow(link):
+                queue.append(link)
+
+    def visit_rest(page) -> None:
+        """Open the queued pages after the first, in the same browser context."""
+        enqueue(links(page))
+        while queue and len(visited_pages) < max(1, max_pages):
+            target = queue.pop(0)
+            if target in visited_pages:
+                continue
+            visited_pages.add(target)
+            progress(f"Browser opening {target}")
+            response = navigate(page, target)
+            if _page_is_challenged(page, response):
+                progress(f"Skipped {target}: the website asked for verification again.")
+                continue
+            settle(page)
+            enqueue(links(page))
+        if queue:
+            progress(f"Page limit reached; {len(queue)} linked pages were not opened in the browser.")
+
     with sync_playwright() as playwright:
         browser = _launch_chromium(playwright, headless=True)
         try:
             context, page = create_page(browser)
             try:
+                queue.pop(0)
                 response = navigate(page)
                 challenged = _page_is_challenged(page, response)
                 if not challenged:
                     settle(page)
                     challenged = _page_is_challenged(page, response)
+                if not challenged:
+                    visit_rest(page)
             finally:
                 context.close()
         finally:
@@ -217,6 +262,7 @@ def capture_public_assets(
                         raise VerificationIncomplete(
                             "The website presented another verification check; capture was stopped."
                         )
+                    visit_rest(page)
                 finally:
                     try:
                         context.close()
