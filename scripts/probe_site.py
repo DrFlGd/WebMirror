@@ -27,7 +27,9 @@ def visit(page_url, label):
         except Exception as e:
             print("GOTO", e)
         pg.wait_for_timeout(8000)
-        text = pg.inner_text("body")[:1500].replace("\n", " | ")
+        text = pg.inner_text("body")[:2500].replace("\n", " | ")
+        for a in pg.eval_on_selector_all("a[href]", "els => els.map(e => e.textContent.trim().slice(0,40) + ' => ' + e.href)"):
+            print("LINK", a[:250])
         b.close()
     print(f"===== {label} {page_url}")
     print("HOSTS", dict(hosts))
