@@ -5,6 +5,7 @@ services that need an online backend cannot be inferred by a static crawler.
 """
 from __future__ import annotations
 
+import codecs
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
@@ -63,6 +64,43 @@ MIME_EXTENSIONS = {
     "image/svg+xml": ".svg", "image/png": ".png", "image/jpeg": ".jpg",
     "image/webp": ".webp", "image/gif": ".gif", "font/woff2": ".woff2",
 }
+
+# The charset a page names in <meta charset> or <meta http-equiv="Content-Type">.
+META_CHARSET = re.compile(rb"""<meta[^>]+charset\s*=\s*["']?\s*(?P<name>[\w.:-]+)""", re.I)
+HEADER_CHARSET = re.compile(r"""charset\s*=\s*["']?(?P<name>[\w.:-]+)""", re.I)
+
+
+def text_encoding(content_type: str, data: bytes, kind: str) -> str:
+    """The encoding to read a downloaded HTML, CSS or JS file with.
+
+    Many servers send "text/html" with no charset, and requests then assumes
+    ISO-8859-1, which garbles every non-ASCII character of a UTF-8 page ("›" turns
+    into "â€º"). A browser reads the page's own <meta charset> instead and
+    otherwise UTF-8 for modern files, so do the same.
+    """
+    candidates = []
+    match = HEADER_CHARSET.search(content_type or "")
+    if match:
+        candidates.append(match.group("name"))
+    if data.startswith(b"\xef\xbb\xbf"):
+        candidates.append("utf-8-sig")
+    if kind == "html":
+        match = META_CHARSET.search(bytes(data[:4096]))
+        # As in a browser, a page that names UTF-16 in its own ASCII text is UTF-8.
+        if match and not match.group("name").lower().startswith((b"utf-16", b"utf-32")):
+            candidates.append(match.group("name").decode("ascii", "replace"))
+    for name in candidates + ["utf-8"]:
+        try:
+            codecs.lookup(name)
+        except LookupError:
+            continue
+        return name
+    return "utf-8"
+
+
+def declare_utf8(html: str) -> str:
+    """Saved pages are always written as UTF-8, so their <meta> must say so."""
+    return re.sub(r"""(<meta[^>]+charset\s*=\s*["']?\s*)[\w.:-]+""", r"\1utf-8", html, count=1, flags=re.I)
 
 
 def normalize_url(value: str) -> str:
@@ -335,7 +373,7 @@ class MirrorEngine:
             return False
         self.visited[target] = local
         if kind in ("html", "css", "js", "manifest"):
-            text = data.decode("utf-8", errors="replace")
+            text = data.decode(text_encoding("", data, kind), errors="replace")
             if kind == "html":
                 if (re.search(r"<title>\s*Just a moment[.\s]*</title>", text, re.I)
                         or "cf-chl-opt" in text):
@@ -602,7 +640,7 @@ class MirrorEngine:
                         self.visited.setdefault(final, local)
                 base = final
                 if kind in ("html", "css", "js", "manifest"):
-                    charset = response.encoding or "utf-8"
+                    charset = text_encoding(response.headers.get("Content-Type", ""), bytes(data), kind)
                     text = bytes(data).decode(charset, errors="replace")
                     if kind == "html":
                         # Don't archive anti-bot / login challenge pages as a valid site.
@@ -780,7 +818,7 @@ class MirrorEngine:
                     tag.string.replace_with(self._rewrite_js(str(tag.string), effective_base))
                 elif kind == "importmap":
                     tag.string.replace_with(self._rewrite_import_map(str(tag.string), effective_base))
-        return str(soup)
+        return declare_utf8(str(soup))
 
     def _rewrite_import_map(self, text: str, base: str) -> str:
         """Point an import map's modules, and its folder prefixes, at the saved copies.
@@ -862,6 +900,13 @@ class _QuietHandler(SimpleHTTPRequestHandler):
         if wants_html and not PurePosixPath(target_path).suffix:
             return super().translate_path(self.entry)
         return actual
+
+    def guess_type(self, path: str | os.PathLike[str]) -> str:
+        # Saved HTML, CSS and JS are UTF-8; say so, or browsers may read them as Latin-1.
+        kind = super().guess_type(path)
+        if kind.startswith("text/") or kind in ("application/json", "application/manifest+json"):
+            return kind + "; charset=utf-8"
+        return kind
 
     def log_message(self, format: str, *args: object) -> None:
         pass
