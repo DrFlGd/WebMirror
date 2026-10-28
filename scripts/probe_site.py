@@ -1,26 +1,25 @@
-import re, requests, base64, gzip, json
-from urllib.parse import urljoin
-UA = {"User-Agent": "Mozilla/5.0"}
-for path in ["/", "/generators/case/", "/robots.txt", "/terms/", "/privacy/", "/license/", "/about/"]:
-    r = requests.get("https://alpaco.it" + path, headers=UA, timeout=30)
-    print("PAGE", path, r.status_code, r.headers.get("content-type"), len(r.content))
-    if path in ("/robots.txt",):
-        print(r.text[:1500])
-    if path in ("/generators/case/",):
-        html = r.text
-        print("HTMLGZ", base64.b64encode(gzip.compress(html.encode())).decode())
-        srcs = re.findall(r'(?:src|href)="([^"]+)"', html)
-        print("REFS", json.dumps(srcs))
-        for s in srcs:
-            if re.search(r"\.m?js(\?|$)", s):
-                u = urljoin(r.url, s)
-                t = requests.get(u, headers=UA, timeout=30).text
-                hits = sorted(set(re.findall(r"[\w./@:-]*(?:wasm|openscad|manifold|worker|cdn|unpkg|jsdelivr|esm\.sh|import\()[\w./@:?=-]*", t, re.I)))[:80]
-                print("JS", u, len(t), json.dumps(hits))
-    if path in ("/terms/", "/privacy/", "/license/", "/about/") and r.status_code == 200:
-        text = re.sub(r"<[^>]+>", " ", r.text)
-        text = re.sub(r"\s+", " ", text)
-        for kw in ["copy", "licen", "reproduc", "mirror", "scrap", "download", "personal use", "commercial"]:
-            for m in re.finditer(kw, text, re.I):
-                print("TERMS", path, kw, "|", text[max(0, m.start()-150): m.start()+200])
-                break
+import re, requests
+from urllib.parse import urljoin, urlparse
+UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130 Safari/537.36"}
+base = "https://www.generatestl.com/"
+seen = {}
+for u in [base, base + "gear-generator/", base + "sitemap.xml", base + "robots.txt"]:
+    r = requests.get(u, headers=UA, timeout=30)
+    seen[u] = r.text
+    print("GET", u, r.status_code, len(r.text), r.headers.get("content-type"), r.headers.get("server"), r.headers.get("x-powered-by"))
+print("SITEMAP", re.findall(r"<loc>([^<]+)</loc>", seen[base + "sitemap.xml"])[:80])
+print("ROBOTS", seen[base + "robots.txt"][:600])
+for page in [base, base + "gear-generator/"]:
+    html = seen[page]
+    links = sorted({urljoin(page, h) for h in re.findall(r'href="([^"#]+)"', html) if urlparse(urljoin(page, h)).netloc.endswith("generatestl.com")})
+    print("LINKS", page, links[:80])
+    scripts = sorted({urljoin(page, s) for s in re.findall(r'<script[^>]+src="([^"]+)"', html)})
+    print("SCRIPTS", page, scripts)
+    for s in scripts:
+        try:
+            js = requests.get(s, headers=UA, timeout=30).text
+        except Exception as e:
+            print("ERR", s, e); continue
+        hits = set(re.findall(r'["\'`](https?://[^"\'`\s]{3,80})["\'`]', js)) | set(re.findall(r'["\'`](/api/[\w/-]+)', js))
+        if hits: print("JS", s, len(js), sorted(hits)[:40])
+print("FRAMEWORK", "__NEXT_DATA__" in seen[base], "_next/" in seen[base], "astro" in seen[base].lower(), "svelte" in seen[base].lower())
