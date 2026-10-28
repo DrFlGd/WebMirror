@@ -28,6 +28,11 @@ import requests
 
 MAX_FILES = 1500
 MAX_BYTES = 30 * 1024 * 1024
+# Pages the browser opens in one mirror: the entry page and the linked pages under
+# its path. Each one runs, so tools that load an engine only when opened get it.
+MAX_PAGES = 40
+# A link to these opens a page; other extensions are files the static crawl fetches.
+PAGE_EXTENSIONS = ("", ".html", ".htm", ".php", ".asp", ".aspx")
 # Windows disallows names beyond 255 characters and often rejects complete
 # paths beyond 260 characters. Leave room for the user's mirror-directory path.
 MAX_LOCAL_COMPONENT = 96
@@ -131,8 +136,10 @@ class MirrorEngine:
                  max_files: int = MAX_FILES, max_bytes: int = MAX_BYTES,
                  include_pages_files: bool = False, browser_capture: bool = False,
                  manual_verification: bool = False,
-                 on_verification_required: Callable[[str], None] | None = None):
+                 on_verification_required: Callable[[str], None] | None = None,
+                 max_pages: int = MAX_PAGES):
         self.library = library
+        self.max_pages = max_pages
         self.progress = progress or (lambda message: None)
         self.max_files = max_files
         self.max_bytes = max_bytes
@@ -153,6 +160,9 @@ class MirrorEngine:
         self.failures: list[str] = []
         self.pages = 0
         self.html_paths: set[str] = set()
+        # In-scope page links the static crawl could not fetch: the browser tries
+        # them, and any still missing get a page that sends visitors to the live site.
+        self.unfetched_pages: dict[str, str] = {}
         self.extra_files = 0
         self.root = Path(tempfile.mkdtemp(prefix=".webmirror-", dir=self.library.directory))
         self.session = requests.Session()
@@ -173,6 +183,7 @@ class MirrorEngine:
                 )
             if self.include_pages_files:
                 self._download_github_pages_assets(url)
+            self._write_live_links()
             self._write_routes()
             record = MirrorRecord(
                 key=key, url=url, entry=entry,
@@ -213,6 +224,8 @@ class MirrorEngine:
                 progress=self.progress,
                 allow_manual_verification=self.manual_verification,
                 on_verification_required=self.on_verification_required,
+                pages=self._known_pages(url), follow=self._is_page_link,
+                max_pages=self.max_pages,
             )
         except (BrowserUnavailable, OSError, RuntimeError) as exc:
             self.failures.append("Browser capture unavailable: " + str(exc)[:300])
@@ -233,6 +246,39 @@ class MirrorEngine:
                 added += 1
         self._browser_assets.clear()
         self.progress(f"Captured {added} additional dynamic resources.")
+
+    def _known_pages(self, entry: str) -> list[str]:
+        """In-scope pages found so far, for the browser to open after the entry."""
+        found = [target for target, local in self.visited.items()
+                 if local in self.html_paths and target != entry]
+        return found + [target for target in self.unfetched_pages if target not in found]
+
+    def _is_page_link(self, target: str) -> bool:
+        if not self._within_scope(target):
+            return False
+        return PurePosixPath(urlsplit(target).path).suffix.lower() in PAGE_EXTENSIONS
+
+    def _write_live_links(self) -> None:
+        """Give each page link that never downloaded a page pointing at the live one.
+
+        Its link was already rewritten to the local path, so without this it would
+        be a dead end offline; with it, it opens the site when there is a connection.
+        """
+        for target, local in self.unfetched_pages.items():
+            if self.visited.get(target):
+                continue
+            output = self.root / local.lstrip("/")
+            if output.exists():
+                continue
+            escaped = target.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(
+                "<!doctype html><meta charset=\"utf-8\">"
+                f"<meta http-equiv=\"refresh\" content=\"0;url={escaped}\">"
+                f"<title>Not saved offline</title><p>This page was not saved offline. "
+                f"<a href=\"{escaped}\">Open it online</a>.</p>\n",
+                encoding="utf-8",
+            )
 
     def _store_browser_asset(self, target: str, mime: str, data: bytes) -> bool:
         """Store a browser-observed resource, without refetching or losing its URL."""
@@ -552,6 +598,13 @@ class MirrorEngine:
         if target is None or (navigation and not self._within_scope(target)):
             return link
         saved = self._download(target, hint=hint)
+        if not saved and navigation and self._is_page_link(target):
+            # A page still being saved (a link back to it) will be at its usual
+            # path. One the static crawl could not fetch, often because the site
+            # refuses non-browser requests, is opened by the browser capture.
+            saved = "/" + self._destination(target, "html").as_posix()
+            if target not in self.in_progress:
+                self.unfetched_pages[target] = saved
         if not saved:
             return link
         fragment = urlsplit(link).fragment
@@ -576,6 +629,10 @@ class MirrorEngine:
             # Bare package names aren't URLs: leave import "react" untouched.
             is_import = re.match(r"^\s*(import|export)\b", match["prefix"]) is not None
             if is_import and not (link.startswith((".", "/", "http://", "https://"))):
+                return match[0]
+            # fetch("/tools/" + name): the literal is only the start of a URL built
+            # at run time. Same-site paths are kept in the mirror, so leave it as is.
+            if text[match.end():match.end() + 40].lstrip().startswith("+"):
                 return match[0]
             hint = ("js" if (is_import or match["prefix"].lstrip().startswith("import(")
                              or "Worker" in match["prefix"]) else "")

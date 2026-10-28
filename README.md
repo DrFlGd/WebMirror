@@ -11,7 +11,7 @@ A small Python desktop app for saving public, mostly static websites and serving
 - Download same-site pages, styles, images, fonts, scripts, and referenced cross-origin assets; rewrite links for local hosting.
 - Preserve URL subpaths (for example, `/terrain-press/` on GitHub Pages).
 - Optional **GitHub Pages: include all published repository files** mode to capture data files with dynamically computed names (may consume hundreds of MB).
-- **Dynamic browser capture** (enabled by default in the GUI) observes assets fetched by JavaScript in a clean Chrome/Edge browser session. It can recover lazy bundles, images, fonts, WASM and public initial GET data.
+- **Dynamic browser capture** (enabled by default in the GUI) observes assets fetched by JavaScript in a clean Chrome/Edge browser session. It can recover lazy bundles, images, fonts, WASM and public initial GET data. The browser opens the entry page and then every linked page under the same path (up to 40), including links a script adds, so each tool page on a hub keeps the engine it loads when opened. A page link that could not be saved opens the live page instead.
 - **Human verification handoff:** If a robot-check interstitial appears, WebMirror can open a visible browser so you complete the check yourself and then continue capturing eligible public assets (subject to website restrictions).
 - Original SPA routes (such as `/drawer` and `/app`) and query-string asset URLs work when hosting offline. Nested client-side routes fall back to the saved app shell.
 - Host only on `127.0.0.1`, not on your network.
