@@ -45,6 +45,16 @@ JS_LITERAL = re.compile(
     r"""(?P<prefix>\b(?:import|export)\s+(?:[^\n;]{0,200}?\s+from\s*)?|\bimport\s*\(\s*|\bnew\s+URL\s*\(\s*|\bfetch\s*\(\s*|\bnew\s+(?:Worker|SharedWorker)\s*\(\s*)(?P<q>['"])(?P<url>[^'"]+)(?P=q)""",
     re.M,
 )
+# A webpack runtime names every chunk it can load later, either as whole paths
+# ("static/chunks/7701.6846ef15632e87c4.js") or as a folder, a name and a map of
+# chunk id to content hash ("static/chunks/" + id + "." + {7701: "6846..."}[id] + ".js").
+WEBPACK_PUBLIC_PATH = re.compile(r"""\b\w+\.p\s*=\s*(['"])(?P<path>[^'"]*)\1""")
+WEBPACK_CHUNK_PATH = re.compile(r"""(['"])(?P<path>static/(?:chunks|css)/[^'"+]+\.(?:js|css))\1""")
+WEBPACK_CHUNK_MAP = re.compile(
+    r"""(['"])(?P<folder>static/(?:chunks|css)/)\1\s*\+\s*(?P<name>\([^;]*?\)|\w+)\s*\+\s*"""
+    r"""(['"])(?P<sep>[.-])\4\s*\+\s*\(?\s*(?P<map>\{[^{}]*\})\s*\)?\s*\[\w+\]\s*\+\s*"""
+    r"""(['"])(?P<ext>\.(?:js|css))\7"""
+)
 SKIP_PREFIXES = ("data:", "blob:", "javascript:", "mailto:", "tel:", "about:", "#", "//#")
 MIME_EXTENSIONS = {
     "text/html": ".html", "text/css": ".css", "text/javascript": ".js",
@@ -652,7 +662,32 @@ class MirrorEngine:
 
         return CSS_URL.sub(url_replace, text)
 
+    def _webpack_chunks(self, text: str, base: str) -> list[str]:
+        """Every chunk a webpack runtime can load later, as absolute URLs.
+
+        Chunks load only when the page needs them, often when a control is first
+        used, so a browser visit misses some; offline, a missing one breaks the app.
+        """
+        public = WEBPACK_PUBLIC_PATH.search(text)
+        if public:
+            root = urljoin(base, public["path"])
+        elif "/_next/static/" in base:
+            root = base.split("/_next/static/")[0] + "/_next/"
+        else:
+            return []
+        paths = {match["path"] for match in WEBPACK_CHUNK_PATH.finditer(text)}
+        for match in WEBPACK_CHUNK_MAP.finditer(text):
+            hashes = dict(re.findall(r"""['"]?([\w-]+)['"]?\s*:\s*['"]([0-9a-f]{6,})['"]""", match["map"]))
+            # Names that differ from the chunk id: (5099===e?"892990c8":e) or ({5099:"name"})[e]||e.
+            names = dict(re.findall(r"""(\d+)\s*===\s*\w+\s*\?\s*['"]([^'"]+)['"]""", match["name"]))
+            names.update(re.findall(r"""['"]?(\d+)['"]?\s*:\s*['"]([^'"]+)['"]""", match["name"]))
+            for chunk, digest in hashes.items():
+                paths.add(f"{match['folder']}{names.get(chunk, chunk)}{match['sep']}{digest}{match['ext']}")
+        return sorted(urljoin(root, path) for path in paths)
+
     def _rewrite_js(self, text: str, base: str) -> str:
+        for chunk in self._webpack_chunks(text, base):
+            self._download(chunk, hint="css" if chunk.endswith(".css") else "js")
         def replace(match: re.Match) -> str:
             link = match["url"]
             # Bare package names aren't URLs: leave import "react" untouched.

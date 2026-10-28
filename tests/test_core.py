@@ -649,3 +649,32 @@ def test_import_map_modules_are_saved_and_point_at_the_copies(tmp_path):
     assert prefix.startswith("/_external/") and prefix.endswith("/")
     assert (folder / prefix[1:] / "loaders/STLLoader.js").is_file()
     assert record.failures == 0
+
+
+def test_webpack_chunks_loaded_later_are_saved(tmp_path):
+    """A Next.js page loads some chunks only when a control is used; save them all."""
+    site = tmp_path / "site"
+    chunks = site / "_next/static/chunks"
+    chunks.mkdir(parents=True)
+    runtime = (
+        'a.p="/_next/";a.u=e=>7701===e?"static/chunks/7701.6846ef15632e87c4.js":'
+        '"static/chunks/"+(5099===e?"892990c8":e)+"-"+({240:"c3626b005be6aa3c",5099:"f29c126a2f372fbc"})[e]+".js";'
+    )
+    (chunks / "webpack-1eb2eb7b.js").write_text(runtime, encoding="utf-8")
+    for name in ("7701.6846ef15632e87c4.js", "240-c3626b005be6aa3c.js", "892990c8-f29c126a2f372fbc.js"):
+        (chunks / name).write_text("self.chunk = 1;", encoding="utf-8")
+    (site / "index.html").write_text(
+        '<html><head><script src="/_next/static/chunks/webpack-1eb2eb7b.js"></script></head>'
+        "<body>App</body></html>", encoding="utf-8")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), partial(SilentHandler, directory=str(site)))
+    Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        library = MirrorLibrary(tmp_path / "data")
+        record = MirrorEngine(library).mirror(f"http://127.0.0.1:{server.server_port}/")
+    finally:
+        server.shutdown()
+    saved = library.path(record) / "_next/static/chunks"
+    assert (saved / "7701.6846ef15632e87c4.js").is_file()
+    assert (saved / "240-c3626b005be6aa3c.js").is_file()
+    assert (saved / "892990c8-f29c126a2f372fbc.js").is_file()
+    assert record.failures == 0
