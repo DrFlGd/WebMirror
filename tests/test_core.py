@@ -678,3 +678,53 @@ def test_webpack_chunks_loaded_later_are_saved(tmp_path):
     assert (saved / "240-c3626b005be6aa3c.js").is_file()
     assert (saved / "892990c8-f29c126a2f372fbc.js").is_file()
     assert record.failures == 0
+
+
+def test_utf8_text_without_a_charset_header_keeps_its_characters(tmp_path):
+    """Servers often send "text/html" with no charset; the page's own <meta> says UTF-8."""
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "index.html").write_text(
+        '<!doctype html><html><head><meta charset="utf-8"><script src="app.js"></script></head>'
+        "<body>Fusion ↗ · See all Pro features › – Ø</body></html>", encoding="utf-8")
+    (site / "app.js").write_text('const label = "Fusion ↗ – Ø";', encoding="utf-8")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), partial(SilentHandler, directory=str(site)))
+    Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        library = MirrorLibrary(tmp_path / "data")
+        record = MirrorEngine(library).mirror(f"http://127.0.0.1:{server.server_port}/")
+    finally:
+        server.shutdown()
+    folder = library.path(record)
+    assert "Fusion ↗ · See all Pro features › – Ø" in (folder / "index.html").read_text("utf-8")
+    assert '"Fusion ↗ – Ø"' in (folder / "app.js").read_text("utf-8")
+    mirror = MirrorServer(library)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    url = mirror.start(record, port=port)
+    try:
+        page = requests.get(url, timeout=5)
+        script = requests.get(url.rsplit("/", 1)[0] + "/app.js", timeout=5)
+    finally:
+        mirror.stop()
+    assert "charset=utf-8" in page.headers["Content-Type"]
+    assert "charset=utf-8" in script.headers["Content-Type"]
+    assert "See all Pro features ›" in page.text
+
+
+def test_latin1_page_is_saved_as_utf8_and_says_so(tmp_path):
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "index.html").write_bytes(
+        '<html><head><meta charset="iso-8859-1"></head><body>Größe: 5 mm</body></html>'.encode("latin-1"))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), partial(SilentHandler, directory=str(site)))
+    Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        library = MirrorLibrary(tmp_path / "data")
+        record = MirrorEngine(library).mirror(f"http://127.0.0.1:{server.server_port}/")
+    finally:
+        server.shutdown()
+    html = (library.path(record) / "index.html").read_text("utf-8")
+    assert "Größe: 5 mm" in html
+    assert 'charset="utf-8"' in html
