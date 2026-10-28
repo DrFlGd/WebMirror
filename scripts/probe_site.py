@@ -1,77 +1,84 @@
-import json, sys, tempfile, collections
-from pathlib import Path
-from urllib.parse import urlsplit
-from playwright.sync_api import sync_playwright
-from webmirror.core import MirrorEngine, MirrorLibrary, MirrorServer
+import json, re, sys, time
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urljoin, urlsplit
+import requests
+from bs4 import BeautifulSoup
 
-URL = sys.argv[1]
-ACTIONS = sys.argv[2:]
+BASE = "https://skipthecad.com/"
+H = {"User-Agent": "Mozilla/5.0 (compatible; GeneratorLibraryCatalog/1.0)"}
+s = requests.Session()
+s.headers.update(H)
+
+print("ROBOTS", s.get(BASE + "robots.txt", timeout=20).text[:1500].replace("\n", " | "))
+urls = set()
+todo = [BASE + "sitemap.xml", BASE + "sitemap-index.xml", BASE + "sitemap_index.xml"]
+seen = set()
+while todo:
+    u = todo.pop()
+    if u in seen:
+        continue
+    seen.add(u)
+    r = s.get(u, timeout=30)
+    print("SITEMAP", u, r.status_code, len(r.text))
+    if r.status_code != 200:
+        continue
+    for loc in re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", r.text):
+        if loc.endswith(".xml"):
+            todo.append(loc)
+        elif "/generators/" in loc:
+            urls.add(loc)
+print("GENERATOR_PAGES", len(urls))
+if not urls:
+    page = s.get(BASE + "generators/", timeout=30).text
+    for a in BeautifulSoup(page, "html.parser").select("a[href*='/generators/']"):
+        urls.add(urljoin(BASE, a["href"]))
+    print("FROM_INDEX", len(urls))
 
 
-def visit(page_url, label):
-    hosts = collections.Counter()
-    failed, errors, reqs = [], [], []
-    with sync_playwright() as p:
-        b = p.chromium.launch()
-        pg = b.new_page()
-        pg.on("console", lambda m: errors.append(f"{m.type}: {m.text}"[:400]) if m.type in ("error", "warning") else None)
-        pg.on("pageerror", lambda e: errors.append(f"PAGEERROR {e}"[:600]))
-        pg.on("requestfailed", lambda r: failed.append(f"{r.method} {r.url[:200]} {r.failure}"))
-
-        def resp(r):
-            hosts[urlsplit(r.url).netloc] += 1
-            size = r.headers.get("content-length", "?")
-            reqs.append(f"{r.status} {r.request.method} {r.request.resource_type} {size} {r.headers.get('content-type', '')[:40]} {r.url[:220]}")
-
-        pg.on("response", resp)
+def grab(u):
+    for attempt in range(3):
         try:
-            pg.goto(page_url, wait_until="networkidle", timeout=90000)
+            r = s.get(u, timeout=30)
+            break
         except Exception as e:
-            print("GOTO", e)
-        pg.wait_for_timeout(8000)
-        for sel in ACTIONS:
-            try:
-                pg.locator(sel).first.click(timeout=5000)
-                print("CLICKED", sel)
-                pg.wait_for_timeout(15000)
-            except Exception as e:
-                print("NOCLICK", sel, str(e)[:120])
-        text = pg.inner_text("body")[:2500].replace("\n", " | ")
-        for a in pg.eval_on_selector_all("a[href]", "els => els.map(e => e.textContent.trim().slice(0,40) + ' => ' + e.href)"):
-            print("LINK", a[:250])
-        b.close()
-    print(f"===== {label} {page_url}")
-    print("HOSTS", dict(hosts))
-    for r in reqs:
-        print("REQ", r)
-    for f in failed:
-        print("FAILED", f)
-    for e in errors:
-        print("CONSOLE", e)
-    print("TEXT", text)
+            time.sleep(2)
+    else:
+        return {"url": u, "error": "fetch"}
+    soup = BeautifulSoup(r.text, "html.parser")
+    out = {"url": u, "status": r.status_code}
+    out["title"] = soup.title.string.strip() if soup.title and soup.title.string else ""
+    h1 = soup.find("h1")
+    out["h1"] = h1.get_text(" ", strip=True) if h1 else ""
+    m = soup.find("meta", attrs={"name": "description"})
+    out["desc"] = m["content"] if m and m.get("content") else ""
+    out["ld"] = []
+    for t in soup.find_all("script", type="application/ld+json"):
+        try:
+            out["ld"].append(json.loads(t.string or ""))
+        except Exception:
+            pass
+    links = []
+    for a in soup.find_all("a", href=True):
+        href = urljoin(u, a["href"])
+        host = urlsplit(href).netloc
+        if host and "skipthecad.com" not in host:
+            links.append([a.get_text(" ", strip=True)[:60], href])
+    out["links"] = links
+    pairs = []
+    for dt in soup.find_all("dt"):
+        dd = dt.find_next_sibling("dd")
+        if dd:
+            pairs.append([dt.get_text(" ", strip=True)[:40], dd.get_text(" ", strip=True)[:200]])
+    for tr in soup.find_all("tr"):
+        cells = [c.get_text(" ", strip=True)[:200] for c in tr.find_all(["th", "td"])]
+        if len(cells) == 2:
+            pairs.append(cells)
+    out["pairs"] = pairs
+    crumbs = [a.get_text(" ", strip=True) for a in soup.select("nav a, .breadcrumb a")][:12]
+    out["crumbs"] = crumbs
+    return out
 
 
-home = Path(tempfile.mkdtemp())
-lib = MirrorLibrary(home)
-eng = MirrorEngine(lib, progress=lambda m: print("PROGRESS", m[:200]), browser_capture=True)
-rec = eng.mirror(URL)
-folder = lib.path(rec)
-print("RECORD", json.dumps(rec.__dict__))
-files = sorted(str(x.relative_to(folder)) for x in folder.rglob("*") if x.is_file())
-print("FILES", len(files))
-for f in files:
-    print("FILE", f, (folder / f).stat().st_size)
-routes = folder / ".webmirror-routes.json"
-if routes.is_file():
-    for k, v in list(json.loads(routes.read_text("utf-8")).items())[:200]:
-        print("ROUTE", k[:200], "->", v)
-import re as _re
-for f in files:
-    if f.endswith((".js", ".html")):
-        t = (folder / f).read_text("utf-8", "replace")
-        for m in _re.finditer(r"huggingface|\.onnx|transformers|onnxruntime|ormbg|jsdelivr|unpkg|esm\.sh|caches\.open|indexedDB|localModelPath|remoteHost|allowLocalModels|wasmPaths", t):
-            print("GREP", f, t[max(0, m.start()-160):m.end()+160].replace("\n", " "))
-srv = MirrorServer(lib)
-local = srv.start(rec, port=8765)
-visit(local, "MIRROR")
-srv.stop()
+with ThreadPoolExecutor(4) as pool:
+    for rec in pool.map(grab, sorted(urls)):
+        print("REC " + json.dumps(rec, ensure_ascii=False))
