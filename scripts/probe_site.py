@@ -5,6 +5,7 @@ from playwright.sync_api import sync_playwright
 from webmirror.core import MirrorEngine, MirrorLibrary, MirrorServer
 
 URL = sys.argv[1]
+ACTIONS = sys.argv[2:]
 
 
 def visit(page_url, label):
@@ -19,7 +20,8 @@ def visit(page_url, label):
 
         def resp(r):
             hosts[urlsplit(r.url).netloc] += 1
-            reqs.append(f"{r.status} {r.request.method} {r.request.resource_type} {r.url[:220]}")
+            size = r.headers.get("content-length", "?")
+            reqs.append(f"{r.status} {r.request.method} {r.request.resource_type} {size} {r.headers.get('content-type', '')[:40]} {r.url[:220]}")
 
         pg.on("response", resp)
         try:
@@ -27,6 +29,13 @@ def visit(page_url, label):
         except Exception as e:
             print("GOTO", e)
         pg.wait_for_timeout(8000)
+        for sel in ACTIONS:
+            try:
+                pg.locator(sel).first.click(timeout=5000)
+                print("CLICKED", sel)
+                pg.wait_for_timeout(15000)
+            except Exception as e:
+                print("NOCLICK", sel, str(e)[:120])
         text = pg.inner_text("body")[:2500].replace("\n", " | ")
         for a in pg.eval_on_selector_all("a[href]", "els => els.map(e => e.textContent.trim().slice(0,40) + ' => ' + e.href)"):
             print("LINK", a[:250])
