@@ -611,3 +611,41 @@ def test_entry_saved_by_the_browser_after_a_redirect_is_found(tmp_path):
         record = MirrorEngine(library, browser_capture=True).mirror("https://example.org/tools")
     assert record.entry == "/tools/index.html"
     assert "Tools" in (library.path(record) / "tools/index.html").read_text()
+
+
+def test_import_map_modules_are_saved_and_point_at_the_copies(tmp_path):
+    """Modules named in an import map, often on a CDN, load from the mirror."""
+    cdn = tmp_path / "cdn"
+    for rel, content in {
+        "npm/three@1.0/build/three.js": "export const three = 1;",
+        "npm/three@1.0/addons/loaders/STLLoader.js": 'import {three} from "three"; export const loader = three;',
+    }.items():
+        (cdn / rel).parent.mkdir(parents=True, exist_ok=True)
+        (cdn / rel).write_text(content, encoding="utf-8")
+    cdn_server = ThreadingHTTPServer(("127.0.0.1", 0), partial(SilentHandler, directory=str(cdn)))
+    Thread(target=cdn_server.serve_forever, daemon=True).start()
+    cdn_url = f"http://localhost:{cdn_server.server_port}"
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "index.html").write_text(f"""<!doctype html><html><head>
+        <script type="importmap">{{"imports": {{
+            "three": "{cdn_url}/npm/three@1.0/build/three.js",
+            "three/addons/": "{cdn_url}/npm/three@1.0/addons/"}}}}</script>
+        <script type="module">import {{loader}} from "three/addons/loaders/STLLoader.js";</script>
+        </head><body>Viewer</body></html>""", encoding="utf-8")
+    site_server = ThreadingHTTPServer(("127.0.0.1", 0), partial(SilentHandler, directory=str(site)))
+    Thread(target=site_server.serve_forever, daemon=True).start()
+    try:
+        library = MirrorLibrary(tmp_path / "data")
+        record = MirrorEngine(library).mirror(f"http://127.0.0.1:{site_server.server_port}/")
+    finally:
+        cdn_server.shutdown()
+        site_server.shutdown()
+    folder = library.path(record)
+    html = (folder / "index.html").read_text()
+    imports = __import__("json").loads(html.split('type="importmap">')[1].split("</script>")[0])["imports"]
+    assert imports["three"].startswith("/_external/") and (folder / imports["three"][1:]).is_file()
+    prefix = imports["three/addons/"]
+    assert prefix.startswith("/_external/") and prefix.endswith("/")
+    assert (folder / prefix[1:] / "loaders/STLLoader.js").is_file()
+    assert record.failures == 0

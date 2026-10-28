@@ -147,6 +147,7 @@ class MirrorEngine:
         self.browser_capture = browser_capture
         self.manual_verification = manual_verification
         self.on_verification_required = on_verification_required
+        self.import_map: dict[str, str] = {}
 
     def mirror(self, supplied_url: str) -> MirrorRecord:
         url = normalize_url(supplied_url)
@@ -172,6 +173,8 @@ class MirrorEngine:
         # In-scope page links the static crawl could not fetch: the browser tries
         # them, and any still missing get a page that sends visitors to the live site.
         self.unfetched_pages: dict[str, str] = {}
+        # Bare module names from the pages' import maps, and the URL each maps to.
+        self.import_map: dict[str, str] = {}
         self.extra_files = 0
         self.root = Path(tempfile.mkdtemp(prefix=".webmirror-", dir=self.library.directory))
         self.session = requests.Session()
@@ -655,6 +658,10 @@ class MirrorEngine:
             # Bare package names aren't URLs: leave import "react" untouched.
             is_import = re.match(r"^\s*(import|export)\b", match["prefix"]) is not None
             if is_import and not (link.startswith((".", "/", "http://", "https://"))):
+                # The page's import map resolves it, to a copy saved here.
+                mapped = self._import_target(link)
+                if mapped:
+                    self._download(mapped, hint="js")
                 return match[0]
             # fetch("/tools/" + name): the literal is only the start of a URL built
             # at run time. Same-site paths are kept in the mirror, so leave it as is.
@@ -736,7 +743,52 @@ class MirrorEngine:
                 kind = (tag.get("type") or "").lower()
                 if kind in ("", "module", "text/javascript", "application/javascript"):
                     tag.string.replace_with(self._rewrite_js(str(tag.string), effective_base))
+                elif kind == "importmap":
+                    tag.string.replace_with(self._rewrite_import_map(str(tag.string), effective_base))
         return str(soup)
+
+    def _rewrite_import_map(self, text: str, base: str) -> str:
+        """Point an import map's modules, and its folder prefixes, at the saved copies.
+
+        `"three": "https://cdn/.../three.js"` is downloaded like a script tag;
+        `"three/addons/": "https://cdn/.../jsm/"` becomes the local folder its files
+        are saved in, and they are downloaded as modules import them.
+        """
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return text
+        if not isinstance(data, dict):
+            return text
+        mappings = [data.get("imports")]
+        if isinstance(data.get("scopes"), dict):
+            mappings += list(data["scopes"].values())
+        for mapping in mappings:
+            if not isinstance(mapping, dict):
+                continue
+            for name, value in mapping.items():
+                target = self._resolve(base, value) if isinstance(value, str) else None
+                if target is None:
+                    continue
+                self.import_map.setdefault(name, target)
+                if value.endswith("/"):
+                    folder = self._destination(target + "index.js", "js").parent
+                    if folder.parts[:1] != ("_webmirror_longpaths",):
+                        mapping[name] = "/" if folder == Path(".") else f"/{folder.as_posix()}/"
+                else:
+                    mapping[name] = self._replace_link(base, value, hint="js")
+        return json.dumps(data, indent=2)
+
+    def _import_target(self, specifier: str) -> str | None:
+        """The URL a bare import such as "three/addons/x.js" maps to, if any."""
+        if specifier in self.import_map:
+            return self.import_map[specifier]
+        prefixes = [name for name in self.import_map
+                    if name.endswith("/") and specifier.startswith(name)]
+        if not prefixes:
+            return None
+        name = max(prefixes, key=len)
+        return self.import_map[name] + specifier[len(name):]
 
 
 class _QuietHandler(SimpleHTTPRequestHandler):
