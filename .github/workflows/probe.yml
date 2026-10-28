@@ -8,20 +8,12 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install requests && python scripts/probe_site.py
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Run the Generator Library importer
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          git clone -q --depth 1 -b skipthecad https://github.com/DrFlGd/Generator-Library gl
-          cd gl
-          npm ci --no-audit --no-fund > /dev/null
-          node scripts/import-skipthecad.mjs --summary summary.md --cache facts.json
-          node scripts/check-catalog.js | head -3 || true
-          npm test 2>&1 | tail -5
-          head -c 3000 summary.md
-          echo
-          echo "CATALOG $(gzip -c catalog/catalog.json | base64 -w0)"
-          echo "FACTS $(gzip -c facts.json | base64 -w0)"
+      - run: |
+          npm i --no-save playwright@1.48.2 > /dev/null
+          npx playwright install --with-deps chromium > /dev/null 2>&1
+          node scripts/probe_net.js
