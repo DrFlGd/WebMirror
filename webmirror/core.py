@@ -6,6 +6,7 @@ services that need an online backend cannot be inferred by a static crawler.
 from __future__ import annotations
 
 import codecs
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
@@ -27,11 +28,16 @@ from bs4 import BeautifulSoup
 import requests
 
 
-MAX_FILES = 1500
+MAX_FILES = 5000
 MAX_BYTES = 30 * 1024 * 1024
 # Pages the browser opens in one mirror: the entry page and the linked pages under
 # its path. Each one runs, so tools that load an engine only when opened get it.
 MAX_PAGES = 40
+# HTML pages the static crawl saves in one mirror. Pages are fetched one after
+# another from a queue (not by recursion, which a long chain of "related" links
+# would overflow) and don't count toward MAX_FILES, so a large asset count can't
+# leave linked pages behind.
+MAX_CRAWL_PAGES = 1000
 # A link to these opens a page; other extensions are files the static crawl fetches.
 PAGE_EXTENSIONS = ("", ".html", ".htm", ".php", ".asp", ".aspx")
 # Windows disallows names beyond 255 characters and often rejects complete
@@ -185,8 +191,9 @@ class MirrorEngine:
                  include_pages_files: bool = False, browser_capture: bool = False,
                  manual_verification: bool = False,
                  on_verification_required: Callable[[str], None] | None = None,
-                 max_pages: int = MAX_PAGES):
+                 max_pages: int = MAX_PAGES, max_crawl_pages: int = MAX_CRAWL_PAGES):
         self.library = library
+        self.max_crawl_pages = max_crawl_pages
         self.max_pages = max_pages
         self.progress = progress or (lambda message: None)
         self.max_files = max_files
@@ -221,6 +228,9 @@ class MirrorEngine:
         # In-scope page links the static crawl could not fetch: the browser tries
         # them, and any still missing get a page that sends visitors to the live site.
         self.unfetched_pages: dict[str, str] = {}
+        # Linked pages waiting to be saved, and the local path each link already uses.
+        self.page_queue: deque[str] = deque()
+        self.queued_pages: dict[str, str] = {}
         # Bare module names from the pages' import maps, and the URL each maps to.
         self.import_map: dict[str, str] = {}
         self.extra_files = 0
@@ -232,8 +242,11 @@ class MirrorEngine:
         backup = self.library.directory / f".{key}-backup"
         try:
             entry = self._download(url, hint="html")
+            self._crawl_pages()
             if self.browser_capture:
                 self._capture_browser(url)
+                # Pages the browser's copies link to that the crawl hasn't seen yet.
+                self._crawl_pages()
                 entry = self._visited_variant(url) or entry
             if not entry:
                 detail = self.failures[0] if self.failures else "Unknown error"
@@ -273,6 +286,27 @@ class MirrorEngine:
             self.session.close()
             if self.root.exists():
                 shutil.rmtree(self.root, ignore_errors=True)
+
+    def _crawl_pages(self) -> None:
+        """Save the queued page links, breadth first, until none are left."""
+        while self.page_queue:
+            target = self.page_queue.popleft()
+            reserved = self.queued_pages[target]
+            saved = self._download(target, hint="html")
+            if not saved:
+                # Opened by the browser capture, or else a page pointing at the live one.
+                self.unfetched_pages[target] = reserved
+            elif saved != reserved:
+                # Saved under another name (the browser saw a different type):
+                # the links already written point here, so forward them.
+                output = self.root / reserved.lstrip("/")
+                if not output.exists():
+                    output.parent.mkdir(parents=True, exist_ok=True)
+                    output.write_text(
+                        "<!doctype html><meta charset=\"utf-8\">"
+                        f"<meta http-equiv=\"refresh\" content=\"0;url={saved}\">\n",
+                        encoding="utf-8",
+                    )
 
     def _capture_browser(self, url: str) -> None:
         """Copy additional GET resources requested during a real page load."""
@@ -598,7 +632,7 @@ class MirrorEngine:
                 return self.visited.get(target)
             finally:
                 self.in_progress.discard(target)
-        if len(self.visited) >= self.max_files:
+        if len(self.visited) >= self.max_files and target not in self.queued_pages:
             if "resource limit reached" not in self.failures:
                 self.failures.append("resource limit reached")
                 self.progress("Resource limit reached; skipping remaining assets.")
@@ -674,6 +708,23 @@ class MirrorEngine:
         target = self._resolve(base, link)
         if target is None or (navigation and not self._within_scope(target)):
             return link
+        fragment = urlsplit(link).fragment
+        if navigation and self._is_page_link(target) and target not in self.visited:
+            # Save linked pages later, from the queue, at the path linked to now.
+            local = self.queued_pages.get(target)
+            if local is None and target not in self.in_progress:
+                if len(self.queued_pages) < self.max_crawl_pages:
+                    local = "/" + self._destination(target, "html").as_posix()
+                    self.queued_pages[target] = local
+                    self.page_queue.append(target)
+                else:
+                    if "page limit reached" not in self.failures:
+                        self.failures.append("page limit reached")
+                        self.progress(f"Page limit reached; pages after {self.max_crawl_pages} link to the live site.")
+                    local = "/" + self._destination(target, "html").as_posix()
+                    self.unfetched_pages.setdefault(target, local)
+            if local:
+                return local + ("#" + fragment if fragment else "")
         saved = self._download(target, hint=hint)
         if not saved and navigation and self._is_page_link(target):
             # A page still being saved (a link back to it) will be at its usual
@@ -684,7 +735,6 @@ class MirrorEngine:
                 self.unfetched_pages[target] = saved
         if not saved:
             return link
-        fragment = urlsplit(link).fragment
         return saved + ("#" + fragment if fragment else "")
 
     def _rewrite_css(self, text: str, base: str) -> str:

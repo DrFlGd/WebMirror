@@ -117,9 +117,11 @@ def test_failed_refresh_preserves_existing_mirror(origin, tmp_path):
 def test_resource_limit_is_reported(origin, tmp_path):
     library = MirrorLibrary(tmp_path / "data")
     record = MirrorEngine(library, max_files=2).mirror(origin)
-    assert record.files <= 2
+    # Linked pages are still saved; the limit drops assets.
+    assert record.files <= 3
     assert record.failures >= 1
     assert (library.path(record) / "demo/index.html").is_file()
+    assert "About" in (library.path(record) / "demo/about.html").read_text()
 
 
 def test_opt_in_full_assets_mode_ignored_for_non_github(origin, tmp_path):
@@ -728,3 +730,45 @@ def test_latin1_page_is_saved_as_utf8_and_says_so(tmp_path):
     html = (library.path(record) / "index.html").read_text("utf-8")
     assert "Größe: 5 mm" in html
     assert 'charset="utf-8"' in html
+
+
+def test_long_chain_of_linked_pages_is_saved_without_recursion(tmp_path):
+    """A hub of tool pages, each linking to the next ("related tools"), deeper
+    than Python's recursion limit allows a depth-first crawl to follow."""
+    import sys
+
+    site = tmp_path / "origin"
+    count = sys.getrecursionlimit() // 2
+    links = "".join(f'<a href="/tools/t{i}">Tool {i}</a>' for i in range(count))
+    site.mkdir()
+    (site / "index.html").write_text(f"<html><body>{links}</body></html>", encoding="utf-8")
+    for i in range(count):
+        page = site / "tools" / f"t{i}" / "index.html"
+        page.parent.mkdir(parents=True)
+        page.write_text(
+            f'<html><body><a href="/">Home</a><a href="/tools/t{(i + 1) % count}">Next</a>'
+            f'<img src="/tools/t{i}/hero.webp"></body></html>', encoding="utf-8")
+        (page.parent / "hero.webp").write_bytes(b"img")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), partial(SilentHandler, directory=str(site)))
+    Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        library = MirrorLibrary(tmp_path / "data")
+        record = MirrorEngine(library).mirror(f"http://127.0.0.1:{server.server_port}/")
+    finally:
+        server.shutdown()
+        server.server_close()
+    folder = library.path(record)
+    assert record.pages == count + 1
+    assert record.failures == 0
+    last = (folder / f"tools/t{count - 1}/index.html").read_text()
+    assert 'href="/tools/t0/index.html"' in last and 'href="/index.html"' in last
+    assert (folder / f"tools/t{count - 1}/hero.webp").read_bytes() == b"img"
+
+
+def test_pages_beyond_the_crawl_limit_link_to_the_live_site(origin, tmp_path):
+    library = MirrorLibrary(tmp_path / "data")
+    record = MirrorEngine(library, max_crawl_pages=0).mirror(origin)
+    folder = library.path(record)
+    assert record.pages == 1
+    stub = (folder / "demo/about.html").read_text()
+    assert f'content="0;url={origin}about.html"' in stub
