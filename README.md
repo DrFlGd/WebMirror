@@ -19,7 +19,7 @@ A small Python desktop app for saving public, mostly static websites and serving
 - **Pause and resume:** **Pause** stops a mirror after the current page and keeps what it saved. Mirror the same address again and choose **Yes** to continue where it stopped, or **No** to start over.
 - **Only re-download files that changed** (on by default): when a site was mirrored before, WebMirror asks the server whether each saved image, font, model or other binary file changed (`If-None-Match` / `If-Modified-Since`) and reuses the saved copy when it didn't. Pages, styles and scripts are always fetched again.
 - **Filters:** HTTrack-style rules such as `+*.glb -*/forum/*`. `*` matches anything and the last rule that matches a URL decides. `-` leaves matching files and pages out (left-out pages link to the live site); `+` also lets the crawl follow same-site pages outside the starting folder.
-- **Automatic Cloudflare solving** (optional, off by default): if browser capture meets a Cloudflare check, WebMirror retries it in [Scrapling](https://github.com/D4Vinci/Scrapling)'s stealth browser, which solves Turnstile and interstitial checks by itself. If that fails and manual verification is on, the visible-browser handoff below is the fallback. See [Automatic Cloudflare solving](#automatic-cloudflare-solving).
+- **Automatic Cloudflare solving** (optional, off by default): if browser capture meets a Cloudflare check, WebMirror retries it in a browser set up to look like a person's and clicks through the Turnstile or interstitial check itself (a port of [Scrapling](https://github.com/D4Vinci/Scrapling)'s solver). If that fails and manual verification is on, the visible-browser handoff below is the fallback. See [Automatic Cloudflare solving](#automatic-cloudflare-solving).
 - Original SPA routes (such as `/drawer` and `/app`) and query-string asset URLs work when hosting offline. Nested client-side routes fall back to the saved app shell.
 - Host only on `127.0.0.1`, not on your network.
 
@@ -45,8 +45,8 @@ Each executable saves mirrors in your user directory (`~/.webmirror/mirrors`), *
 On a computer with Python 3.10+ installed (and Tkinter available):
 
 ```bash
-python -m pip install -e ".[dynamic,browserlike,stealth]" "pyinstaller>=6.11,<7"
-python -m PyInstaller --noconfirm --clean --onefile --windowed --collect-all playwright --collect-all patchright --collect-all curl_cffi --collect-all scrapling --collect-all browserforge --collect-all apify_fingerprint_datapoints --name WebMirror launcher.py
+python -m pip install -e ".[dynamic,browserlike]" "pyinstaller>=6.11,<7"
+python -m PyInstaller --noconfirm --clean --onefile --windowed --collect-all patchright --collect-all curl_cffi --name WebMirror launcher.py
 ```
 
 On Windows, the executable appears at `dist/WebMirror.exe`. On Linux it is `dist/WebMirror`. On macOS, GitHub Actions instead packages a `WebMirror.app` bundle with the `--onedir --windowed` flags.
@@ -67,7 +67,7 @@ python -m venv .venv
 source .venv/bin/activate
 # Windows PowerShell:
 # .venv\Scripts\Activate.ps1
-python -m pip install -e ".[dynamic,browserlike]"   # add ,stealth for automatic Cloudflare solving
+python -m pip install -e ".[dynamic,browserlike]"
 python -m webmirror
 ```
 
@@ -96,10 +96,10 @@ If **Capture JavaScript-loaded assets** is unchecked, verification prompts are d
 
 ## Automatic Cloudflare solving
 
-Tick **Solve Cloudflare checks automatically with Scrapling's stealth browser** (it needs **Capture JavaScript-loaded assets** too). When the normal browser capture meets a Cloudflare check, WebMirror opens Scrapling's patched Chrome in the background, lets it pass the check, and then captures the site from that browser exactly as a normal capture would.
+Tick **Try to pass Cloudflare checks automatically** (it needs **Capture JavaScript-loaded assets** too). When the normal browser capture meets a Cloudflare check, WebMirror opens a second, hidden browser with a fresh profile and settings that make it look like a person's, clicks through the check, and then captures the site from that browser exactly as a normal capture would.
 
-- It uses your installed Google Chrome. Without Chrome, run `scrapling install` once to download Scrapling's own browser (source installs only).
-- From source, install it with `pip install -e ".[stealth]"`. The downloadable apps include it.
+- Browser capture is driven by [patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python), a version of Playwright with its automation traces removed, which is what lets the check pass. It uses your installed Chrome or Edge.
+- The solver is ported from Scrapling (BSD-3-Clause; notice in `webmirror/cloudflare.py`), so Scrapling itself is not needed.
 - It is a fresh, temporary profile: no cookies or sign-ins from your own browser are used.
 - Solving a check does not make it acceptable to copy a site. Use it only for sites you are allowed to mirror, and respect their terms and server load. Some sites will still refuse.
 

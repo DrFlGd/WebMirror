@@ -252,8 +252,8 @@ class MirrorEngine:
         polite: pace requests by how fast each site answers, and back off and
             retry when it answers 429 or 503 (see net.AutoThrottle).
         obey_robots: don't fetch what robots.txt disallows; honour Crawl-delay.
-        auto_solve_challenges: let Scrapling's stealth browser solve Cloudflare
-            checks during browser capture (needs the "stealth" extra).
+        auto_solve_challenges: when browser capture meets a Cloudflare check, try
+            to pass it in a browser set up to look like a person's (cloudflare.py).
         pause_event: set it to pause after the current page; resume with
             mirror(url, resume=True).
         update_unchanged: when the site was mirrored before, ask the server

@@ -141,8 +141,10 @@ def fake_playwright(monkeypatch, *, never_solve=False):
     package.__path__ = []
     sync_api = ModuleType("playwright.sync_api")
     sync_api.sync_playwright = lambda: FakeManager(playwright)
-    monkeypatch.setitem(sys.modules, "playwright", package)
-    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
+    # The capture prefers patchright and falls back to Playwright: fake both.
+    for name in ("playwright", "patchright"):
+        monkeypatch.setitem(sys.modules, name, package)
+        monkeypatch.setitem(sys.modules, f"{name}.sync_api", sync_api)
     return playwright
 
 

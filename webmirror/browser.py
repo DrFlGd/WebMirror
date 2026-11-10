@@ -3,15 +3,22 @@
 A clean temporary Chromium profile is used for each capture. If a website
 challenges the browser, the user may complete the verification in a *visible*
 Chrome or Edge window. Only when the user turns on automatic solving does
-WebMirror hand a Cloudflare check to Scrapling's stealth browser (the optional
-"stealth" extra) to solve. It never uses stored account cookies or archives
-private browser profiles.
+WebMirror try to pass a Cloudflare check by itself (see cloudflare.py). It never
+uses stored account cookies or archives private browser profiles.
+
+The browser is driven with patchright, a drop-in Playwright fork that hides the
+automation traces anti-bot checks look for, or with Playwright when patchright
+is not installed.
 """
 from __future__ import annotations
 
+import shutil
+import tempfile
 from time import monotonic
 from typing import Callable, Iterable
 from urllib.parse import urlsplit
+
+from .cloudflare import IGNORED_DEFAULT_ARGS, STEALTH_ARGS, solve
 
 # One capture may now walk many pages of a site, so the byte budget covers them all.
 CAPTURE_LIMIT = 320 * 1024 * 1024
@@ -38,29 +45,42 @@ def _host_is_blocked(url: str, blocked) -> bool:
     return host_is_blocked(url, blocked)
 
 
-def _stealth_session(**options):
-    """Scrapling's stealth browser session, on the installed Chrome if there is one."""
+def _sync_playwright():
+    """patchright's sync_playwright, or Playwright's when patchright isn't installed."""
     try:
-        from scrapling.fetchers import StealthySession
-    except ImportError as exc:
-        raise BrowserUnavailable(
-            "Automatic Cloudflare solving needs Scrapling. Install with pip install 'webmirror[stealth]'."
-        ) from exc
-    errors = []
-    for real_chrome in (True, False):
-        session = StealthySession(real_chrome=real_chrome, **options)
+        from patchright.sync_api import sync_playwright
+    except ImportError:
         try:
-            session.start()
-            return session
+            from playwright.sync_api import sync_playwright
+        except ImportError as exc:
+            raise BrowserUnavailable(
+                "Browser capture needs patchright. Install with pip install 'webmirror[dynamic]'."
+            ) from exc
+    return sync_playwright
+
+
+def _stealth_context(playwright):
+    """A persistent, temporary-profile browser set up to look like a person's.
+
+    Returns the context and its profile folder, which the caller deletes.
+    """
+    profile = tempfile.mkdtemp(prefix="webmirror-profile-")
+    errors = []
+    for channel in ("chrome", "msedge", None):
+        options = {
+            "user_data_dir": profile, "headless": True, "no_viewport": True,
+            "args": list(STEALTH_ARGS), "ignore_default_args": list(IGNORED_DEFAULT_ARGS),
+        }
+        if channel:
+            options["channel"] = channel
+        try:
+            return playwright.chromium.launch_persistent_context(**options), profile
         except Exception as exc:
             errors.append(str(exc).splitlines()[0] if str(exc) else type(exc).__name__)
-            try:
-                session.close()
-            except Exception:
-                pass
+    shutil.rmtree(profile, ignore_errors=True)
     raise BrowserUnavailable(
-        "The stealth browser could not start. Install Google Chrome, or run "
-        "'scrapling install' once to download its browser. " + "; ".join(errors[:2])
+        "No Chrome, Edge or Chromium browser could start for automatic solving. "
+        + "; ".join(errors[:2])
     )
 
 
@@ -142,15 +162,11 @@ def capture_public_assets(
 
     Requests to `blocked_domains` (and their subdomains) are refused, which keeps
     ads and trackers from loading. With `auto_solve`, a challenged capture is
-    first retried in Scrapling's stealth browser, which solves Cloudflare checks
-    by itself; manual verification, if allowed, is the fallback.
+    first retried in a browser set up to look like a person's, which passes the
+    Cloudflare check by itself (cloudflare.solve); manual verification, if
+    allowed, is the fallback.
     """
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise BrowserUnavailable(
-            "Browser capture needs Playwright. Install with pip install 'webmirror[dynamic]'."
-        ) from exc
+    sync_playwright = _sync_playwright()
 
     origin = (urlsplit(url).scheme.lower(), urlsplit(url).netloc.lower())
     blocked = frozenset(blocked_domains or ())
@@ -158,8 +174,8 @@ def capture_public_assets(
     total_bytes = 0
     failed: list[str] = []
 
-    # Responses seen by the stealth browser, read once its page has settled:
-    # Scrapling's patched Playwright can't read a body inside the event itself.
+    # Responses are read once their page has settled: patchright can't read a
+    # body inside the response event itself.
     pending: list = []
 
     def drain() -> None:
@@ -172,6 +188,8 @@ def capture_public_assets(
         parsed = urlsplit(target)
         if (parsed.scheme.lower(), parsed.netloc.lower()) != origin:
             return
+        if parsed.path.startswith("/cdn-cgi/"):
+            return  # Cloudflare's own scripts, not the website's
         if target in captured or len(captured) >= max_files:
             return
         if response.request.method != "GET" or not 200 <= response.status < 300:
@@ -207,9 +225,12 @@ def capture_public_assets(
         if blocked:
             context.route("**/*", block_ads)
         page = context.new_page()
-        page.on("response", on_response)
-        page.on("requestfailed", lambda req: failed.append(req.url[:180]))
+        listen(page)
         return context, page
+
+    def listen(page) -> None:
+        page.on("response", lambda response: pending.append(response))
+        page.on("requestfailed", lambda req: failed.append(req.url[:180]))
 
     def navigate(page, target=url):
         response = None
@@ -285,58 +306,56 @@ def capture_public_assets(
     if challenged and auto_solve:
         # Do not save response bodies belonging to the challenge itself.
         captured.clear()
+        pending.clear()
         total_bytes = 0
         failed.clear()
-        progress("Verification check detected; trying to solve it automatically "
-                 "with Scrapling's stealth browser...")
+        progress("Verification check detected; trying to pass it automatically...")
         solved = False
-        # If the stealth walk stops partway, the manual fallback starts the pages over.
+        # If the walk stops partway, the manual fallback starts the pages over.
         queue_before, visited_before = list(queue), set(visited_pages)
-
-        def listen(page) -> None:
-            # Before the first load, so the entry page's own files are seen too.
-            page.on("response", lambda response: pending.append(response))
-            page.on("requestfailed", lambda req: failed.append(req.url[:180]))
-
-        def walk_solved(page) -> None:
-            nonlocal solved
-            if _page_is_challenged(page, None):
-                pending.clear()
-                return
-            drain()
-            settle(page)
-            visit_rest(page)
-            solved = True
-
         try:
-            session = _stealth_session(
-                headless=True, solve_cloudflare=True, google_search=False,
-                blocked_domains=set(blocked) or None, timeout=60000,
-            )
-            try:
-                session.fetch(url, page_setup=listen, page_action=walk_solved)
-            finally:
-                session.close()
+            with sync_playwright() as playwright:
+                context, profile = _stealth_context(playwright)
+                try:
+                    if blocked:
+                        context.route("**/*", block_ads)
+                    page = context.pages[0] if context.pages else context.new_page()
+                    listen(page)
+                    navigate(page)
+                    solve(page, progress)
+                    page.wait_for_timeout(1000)
+                    drain()
+                    if not _page_is_challenged(page, None):
+                        settle(page)
+                        visit_rest(page)
+                        solved = True
+                finally:
+                    try:
+                        context.close()
+                    finally:
+                        if profile:
+                            shutil.rmtree(profile, ignore_errors=True)
         except BrowserUnavailable as exc:
             progress(str(exc))
         except Exception as exc:
             progress(f"Automatic verification failed: {str(exc)[:200]}")
         if solved:
             challenged = False
-            progress("Verification check solved automatically; captured the website's resources.")
+            progress("Verification check passed automatically; captured the website's resources.")
         else:
             captured.clear()
+            pending.clear()
             total_bytes = 0
             queue[:] = queue_before
             visited_pages.clear()
             visited_pages.update(visited_before)
-            progress("The check could not be solved automatically.")
+            progress("The check could not be passed automatically.")
 
     if challenged and allow_manual_verification:
-        # A fresh Playwright: the stealth browser above can't share a running one.
         with sync_playwright() as playwright:
             # Do not save response bodies belonging to the challenge itself.
             captured.clear()
+            pending.clear()
             total_bytes = 0
             failed.clear()
             progress("Human verification detected; opening a browser window.")
