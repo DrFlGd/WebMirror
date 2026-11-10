@@ -20,12 +20,18 @@ import posixpath
 import re
 import shutil
 import tempfile
-from threading import Thread
+from threading import Event, Thread
+from time import monotonic
 from typing import Callable
 from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
-import requests
+
+from .ad_domains import AD_DOMAINS
+from .net import (
+    FETCH_ERRORS, USER_AGENT, AutoThrottle, RobotsRules, host_is_blocked,
+    make_session, retry_after_seconds,
+)
 
 
 MAX_FILES = 5000
@@ -44,7 +50,27 @@ PAGE_EXTENSIONS = ("", ".html", ".htm", ".php", ".asp", ".aspx")
 # paths beyond 260 characters. Leave room for the user's mirror-directory path.
 MAX_LOCAL_COMPONENT = 96
 MAX_LOCAL_RELATIVE_PATH = 160
-USER_AGENT = "WebMirror/0.1 (local static website archiver)"
+# A paused mirror keeps its files and this record of where the crawl stopped.
+STATE_FILE = ".webmirror-state.json"
+# ETag and Last-Modified of each saved binary file, so the next capture of the
+# site can ask the server whether it changed instead of downloading it again.
+VALIDATORS_FILE = ".webmirror-validators.json"
+TEXT_KINDS = ("html", "css", "js", "manifest")
+
+
+def parse_filters(text: str | list[str] | None) -> list[tuple[bool, re.Pattern]]:
+    """HTTrack-style rules: "+*.glb -*/forum/*". `*` matches anything; the last
+    rule that matches a URL decides, "+" to include it, "-" to leave it out."""
+    if not text:
+        return []
+    words = text.split() if isinstance(text, str) else [w for item in text for w in item.split()]
+    rules = []
+    for word in words:
+        if word[0] not in "+-" or len(word) < 2:
+            raise ValueError(f'Filter "{word}" must start with + or -, like +*.glb or -*/forum/*')
+        pattern = "^" + ".*".join(re.escape(part) for part in word[1:].split("*")) + "$"
+        rules.append((word[0] == "+", re.compile(pattern, re.I)))
+    return rules
 
 CSS_URL = re.compile(r"""url\(\s*(?P<q>['"]?)(?P<url>[^'")]+)(?P=q)\s*\)""", re.I)
 CSS_IMPORT = re.compile(r"""(@import\s+)(?P<q>['"])(?P<url>[^'"]+)(?P=q)""", re.I)
@@ -131,6 +157,14 @@ def _slug(url: str) -> str:
     return f"{domain}-{sha256(url.encode()).hexdigest()[:12]}"
 
 
+class MirrorPaused(Exception):
+    """The user paused a mirror; its progress is kept so it can be resumed."""
+
+
+class SkippedResource(ValueError):
+    """A URL WebMirror chose not to fetch (robots.txt said no)."""
+
+
 def default_home() -> Path:
     return Path(os.environ.get("WEBMIRROR_HOME", "~/.webmirror")).expanduser()
 
@@ -182,6 +216,18 @@ class MirrorLibrary:
         if folder.is_dir():
             shutil.rmtree(folder)
 
+    def paused_path(self, url: str) -> Path:
+        """Where a paused mirror of `url` keeps its files until it is resumed."""
+        return self.directory / f".paused-{_slug(normalize_url(url))}"
+
+    def is_paused(self, url: str) -> bool:
+        return (self.paused_path(url) / STATE_FILE).is_file()
+
+    def discard_paused(self, url: str) -> None:
+        folder = self.paused_path(url)
+        if folder.is_dir():
+            shutil.rmtree(folder)
+
 
 class MirrorEngine:
     """Download linked resources into a folder and rewrite URLs for local hosting."""
@@ -191,8 +237,42 @@ class MirrorEngine:
                  include_pages_files: bool = False, browser_capture: bool = False,
                  manual_verification: bool = False,
                  on_verification_required: Callable[[str], None] | None = None,
-                 max_pages: int = MAX_PAGES, max_crawl_pages: int = MAX_CRAWL_PAGES):
+                 max_pages: int = MAX_PAGES, max_crawl_pages: int = MAX_CRAWL_PAGES,
+                 browserlike: bool = False, block_ads: bool = False,
+                 polite: bool = False, obey_robots: bool = False,
+                 auto_solve_challenges: bool = False,
+                 pause_event: Event | None = None,
+                 throttle: AutoThrottle | None = None,
+                 update_unchanged: bool = False,
+                 filters: str | list[str] | None = None):
+        """Options beyond the original static crawl, all off by default:
+
+        browserlike: send requests that look like Chrome's (needs curl_cffi).
+        block_ads: skip ad and tracker hosts, in the crawl and in the browser.
+        polite: pace requests by how fast each site answers, and back off and
+            retry when it answers 429 or 503 (see net.AutoThrottle).
+        obey_robots: don't fetch what robots.txt disallows; honour Crawl-delay.
+        auto_solve_challenges: let Scrapling's stealth browser solve Cloudflare
+            checks during browser capture (needs the "stealth" extra).
+        pause_event: set it to pause after the current page; resume with
+            mirror(url, resume=True).
+        update_unchanged: when the site was mirrored before, ask the server
+            whether each saved image, font, model or other binary file changed
+            (If-None-Match / If-Modified-Since) and reuse the saved copy if not.
+        filters: HTTrack-style rules such as "+*.glb -*/forum/*" (see
+            parse_filters). "-" leaves matching URLs out; "+" also lets the crawl
+            follow same-site pages outside the starting folder.
+        """
         self.library = library
+        self.browserlike = browserlike
+        self.block_ads = block_ads
+        self.polite = polite
+        self.obey_robots = obey_robots
+        self.auto_solve_challenges = auto_solve_challenges
+        self.pause_event = pause_event
+        self.throttle = throttle
+        self.update_unchanged = update_unchanged
+        self.filters = parse_filters(filters)
         self.max_crawl_pages = max_crawl_pages
         self.max_pages = max_pages
         self.progress = progress or (lambda message: None)
@@ -204,7 +284,8 @@ class MirrorEngine:
         self.on_verification_required = on_verification_required
         self.import_map: dict[str, str] = {}
 
-    def mirror(self, supplied_url: str) -> MirrorRecord:
+    def mirror(self, supplied_url: str, resume: bool = False) -> MirrorRecord:
+        """Mirror a website. With `resume`, continue a paused mirror of it if there is one."""
         url = normalize_url(supplied_url)
         parsed = urlsplit(url)
         self.origin = (parsed.scheme.lower(), parsed.netloc.lower())
@@ -234,17 +315,44 @@ class MirrorEngine:
         # Bare module names from the pages' import maps, and the URL each maps to.
         self.import_map: dict[str, str] = {}
         self.extra_files = 0
-        self.root = Path(tempfile.mkdtemp(prefix=".webmirror-", dir=self.library.directory))
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": USER_AGENT})
+        self.blocked = 0
+        self.filtered = 0
+        self.reused = 0
+        self.validators: dict[str, dict] = {}
+        self.browser_done = False
+        entry: str | None = None
         key = _slug(url)
         dest = self.library.directory / key
         backup = self.library.directory / f".{key}-backup"
+        paused = self.library.paused_path(url)
+        self.previous_dir = dest
+        self.previous: dict[str, dict] = {}
+        if self.update_unchanged:
+            try:
+                self.previous = json.loads((dest / VALIDATORS_FILE).read_text("utf-8"))
+            except (OSError, ValueError):
+                self.previous = {}
+        resuming = resume and (paused / STATE_FILE).is_file()
+        if resuming:
+            self.root = paused
+            entry = self._load_state()
+            self.progress(f"Resuming the paused mirror ({len(self.page_queue)} pages left in the queue).")
+        else:
+            self.root = Path(tempfile.mkdtemp(prefix=".webmirror-", dir=self.library.directory))
+        self.session = make_session(self.browserlike, self.progress)
+        self.robots = RobotsRules(self.session) if self.obey_robots else None
+        if self.throttle is None and (self.polite or self.obey_robots):
+            # Without "polite", only a robots.txt Crawl-delay paces the crawl.
+            self.throttle = AutoThrottle() if self.polite else AutoThrottle(start_delay=0.0)
         try:
-            entry = self._download(url, hint="html")
+            if not resuming:
+                entry = self._download(url, hint="html")
             self._crawl_pages()
             if self.browser_capture:
-                self._capture_browser(url)
+                if not self.browser_done:
+                    self._check_pause()
+                    self._capture_browser(url)
+                    self.browser_done = True
                 # Pages the browser's copies link to that the crawl hasn't seen yet.
                 self._crawl_pages()
                 entry = self._visited_variant(url) or entry
@@ -258,6 +366,8 @@ class MirrorEngine:
                 self._download_github_pages_assets(url)
             self._write_live_links()
             self._write_routes()
+            (self.root / VALIDATORS_FILE).write_text(json.dumps(self.validators), encoding="utf-8")
+            (self.root / STATE_FILE).unlink(missing_ok=True)
             record = MirrorRecord(
                 key=key, url=url, entry=entry,
                 saved_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -280,16 +390,72 @@ class MirrorEngine:
                 raise
             if backup.exists():
                 shutil.rmtree(backup)
-            self.progress(f"Saved {record.files} resources ({record.pages} HTML pages, {record.failures} skipped/failed).")
+            # A fresh mirror supersedes any paused one of the same site.
+            if paused.exists():
+                shutil.rmtree(paused, ignore_errors=True)
+            blocked = f", {self.blocked} ad/tracker requests blocked" if self.blocked else ""
+            if self.filtered:
+                blocked += f", {self.filtered} left out by filters"
+            if self.reused:
+                blocked += f", {self.reused} unchanged files reused"
+            self.progress(f"Saved {record.files} resources ({record.pages} HTML pages, "
+                          f"{record.failures} skipped/failed{blocked}).")
             return record
+        except MirrorPaused:
+            self._save_state(url, entry)
+            if self.root != paused:
+                if paused.exists():
+                    shutil.rmtree(paused)
+                self.root.rename(paused)
+                self.root = paused
+            self.progress(f"Paused with {self.pages} pages saved and {len(self.page_queue)} "
+                          "waiting. Mirror the same address again to resume.")
+            raise
         finally:
             self.session.close()
-            if self.root.exists():
+            # Keep a paused mirror's files (and one being resumed, if it fails).
+            if self.root.exists() and self.root != paused:
                 shutil.rmtree(self.root, ignore_errors=True)
+
+    def _check_pause(self) -> None:
+        if self.pause_event is not None and self.pause_event.is_set():
+            raise MirrorPaused("Mirror paused.")
+
+    def _save_state(self, url: str, entry: str | None) -> None:
+        state = {
+            "url": url, "entry": entry, "browser_done": self.browser_done,
+            "visited": self.visited, "failures": self.failures, "pages": self.pages,
+            "html_paths": sorted(self.html_paths),
+            "unfetched_pages": self.unfetched_pages,
+            "page_queue": list(self.page_queue), "queued_pages": self.queued_pages,
+            "import_map": self.import_map, "extra_files": self.extra_files,
+            "blocked": self.blocked, "filtered": self.filtered, "reused": self.reused,
+            "validators": self.validators,
+        }
+        (self.root / STATE_FILE).write_text(json.dumps(state), encoding="utf-8")
+
+    def _load_state(self) -> str | None:
+        state = json.loads((self.root / STATE_FILE).read_text("utf-8"))
+        self.visited = dict(state["visited"])
+        self.failures = list(state["failures"])
+        self.pages = int(state["pages"])
+        self.html_paths = set(state["html_paths"])
+        self.unfetched_pages = dict(state["unfetched_pages"])
+        self.page_queue = deque(state["page_queue"])
+        self.queued_pages = dict(state["queued_pages"])
+        self.import_map = dict(state["import_map"])
+        self.extra_files = int(state["extra_files"])
+        self.blocked = int(state.get("blocked", 0))
+        self.filtered = int(state.get("filtered", 0))
+        self.reused = int(state.get("reused", 0))
+        self.validators = dict(state.get("validators", {}))
+        self.browser_done = bool(state["browser_done"])
+        return state["entry"]
 
     def _crawl_pages(self) -> None:
         """Save the queued page links, breadth first, until none are left."""
         while self.page_queue:
+            self._check_pause()
             target = self.page_queue.popleft()
             reserved = self.queued_pages[target]
             saved = self._download(target, hint="html")
@@ -320,6 +486,8 @@ class MirrorEngine:
                 on_verification_required=self.on_verification_required,
                 pages=self._known_pages(url), follow=self._is_page_link,
                 max_pages=self.max_pages,
+                blocked_domains=AD_DOMAINS if self.block_ads else None,
+                auto_solve=self.auto_solve_challenges,
             )
         except (BrowserUnavailable, OSError, RuntimeError) as exc:
             self.failures.append("Browser capture unavailable: " + str(exc)[:300])
@@ -355,10 +523,70 @@ class MirrorEngine:
                  if local in self.html_paths and target != entry]
         return found + [target for target in self.unfetched_pages if target not in found]
 
+    def _filter_verdict(self, target: str) -> bool | None:
+        """True if a "+" rule is the last to match, False for "-", None if none match."""
+        verdict = None
+        for include, pattern in getattr(self, "filters", ()):
+            if pattern.match(target):
+                verdict = include
+        return verdict
+
+    def _in_crawl_scope(self, target: str) -> bool:
+        """Under the starting folder, or a same-site page a "+" filter asks for."""
+        if self._within_scope(target):
+            return True
+        parts = urlsplit(target)
+        return ((parts.scheme.lower(), parts.netloc.lower()) == self.origin
+                and self._filter_verdict(target) is True)
+
+    def _page_candidate(self, target: str) -> bool:
+        """A page the crawl would save, before robots.txt and "-" filters have a say."""
+        return (self._in_crawl_scope(target)
+                and PurePosixPath(urlsplit(target).path).suffix.lower() in PAGE_EXTENSIONS)
+
     def _is_page_link(self, target: str) -> bool:
-        if not self._within_scope(target):
-            return False
-        return PurePosixPath(urlsplit(target).path).suffix.lower() in PAGE_EXTENSIONS
+        # A page robots.txt or a "-" filter keeps out stays a link to the live site.
+        return (self._page_candidate(target) and self._filter_verdict(target) is not False
+                and self._robots_allow(target))
+
+    def _robots_allow(self, target: str) -> bool:
+        robots = getattr(self, "robots", None)
+        if robots is None:
+            return True
+        allowed = robots.allowed(target)
+        delay = robots.crawl_delay(target)
+        if delay and self.throttle is not None and self.throttle.floors.get(
+                urlsplit(target).netloc.lower()) is None:
+            self.throttle.set_floor(target, delay)
+            self.progress(f"robots.txt asks for {delay:g}s between requests to {urlsplit(target).netloc}.")
+        return allowed
+
+    def _fetch(self, target: str, headers: dict | None = None):
+        """GET `target` as a stream, paced, and retried when the site says it is busy."""
+        if not self._robots_allow(target):
+            raise SkippedResource("disallowed by robots.txt")
+        retries = 0
+        while True:
+            if self.throttle is not None:
+                self.throttle.wait(target)
+            started = monotonic()
+            extra = {"headers": headers} if headers else {}
+            response = self.session.get(target, timeout=(5, 20), stream=True, **extra)
+            if not self.polite or self.throttle is None:
+                return response
+            status = getattr(response, "status_code", None)
+            answer = getattr(response, "headers", None) or {}
+            retry_after = (retry_after_seconds(answer.get("Retry-After"))
+                           if status in AutoThrottle.RETRY_STATUSES else None)
+            self.throttle.record(target, monotonic() - started, status, retry_after)
+            if status not in AutoThrottle.RETRY_STATUSES or retries >= self.throttle.max_retries:
+                return response
+            retries += 1
+            close = getattr(response, "close", None)
+            if close:
+                close()
+            self.progress(f"{urlsplit(target).netloc} answered {status}; slowing down to "
+                          f"{self.throttle.delay(target):.1f}s between requests and retrying.")
 
     def _write_live_links(self) -> None:
         """Give each page link that never downloaded a page pointing at the live one.
@@ -493,7 +721,7 @@ class MirrorEngine:
             if tree_data.get("truncated"):
                 self.progress("GitHub returned a truncated tree; some assets may be missing.")
             self.progress(f"Found {len(files)} published files in {owner}/{repo}/{prefix}.")
-        except (requests.RequestException, KeyError, ValueError, TypeError) as exc:
+        except (*FETCH_ERRORS, KeyError, ValueError, TypeError) as exc:
             self.failures.append(f"GitHub Pages file listing unavailable: {exc}")
             self.progress(f"Could not list GitHub Pages files: {exc}")
             return
@@ -533,7 +761,7 @@ class MirrorEngine:
                 self.extra_files += 1
                 if index % 10 == 0:
                     self.progress(f"GitHub Pages assets: {index}/{len(files)} checked...")
-            except (requests.RequestException, ValueError, OSError) as exc:
+            except (*FETCH_ERRORS, ValueError, OSError) as exc:
                 self.failures.append(f"{relative}: {exc}")
                 self.progress(f"Skipped GitHub Pages file {relative}: {exc}")
 
@@ -632,6 +860,14 @@ class MirrorEngine:
                 return self.visited.get(target)
             finally:
                 self.in_progress.discard(target)
+        if self.block_ads and host_is_blocked(target):
+            self.visited[target] = None
+            self.blocked += 1
+            return None
+        if self._filter_verdict(target) is False:
+            self.visited[target] = None
+            self.filtered += 1
+            return None
         if len(self.visited) >= self.max_files and target not in self.queued_pages:
             if "resource limit reached" not in self.failures:
                 self.failures.append("resource limit reached")
@@ -640,9 +876,20 @@ class MirrorEngine:
         self.in_progress.add(target)
         try:
             self.progress(f"Downloading {target}")
-            with self.session.get(target, timeout=(5, 20), stream=True) as response:
-                response.raise_for_status()
-                mime = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            previous = self.previous.get(target) if self.update_unchanged else None
+            conditional = {}
+            if previous and (self.previous_dir / previous["local"].lstrip("/")).is_file():
+                if previous.get("etag"):
+                    conditional["If-None-Match"] = previous["etag"]
+                if previous.get("last_modified"):
+                    conditional["If-Modified-Since"] = previous["last_modified"]
+            with self._fetch(target, headers=conditional or None) as response:
+                unchanged = conditional and getattr(response, "status_code", None) == 304
+                if not unchanged:
+                    response.raise_for_status()
+                headers = getattr(response, "headers", None) or {}
+                mime = (previous["mime"] if unchanged else
+                        headers.get("Content-Type", "").split(";", 1)[0].strip().lower())
                 if hint == "html" or mime in ("text/html", "application/xhtml+xml"):
                     kind = "html"
                 elif hint == "css" or mime == "text/css":
@@ -653,14 +900,18 @@ class MirrorEngine:
                     kind = "manifest"
                 else:
                     kind = mime
-                length = response.headers.get("Content-Length")
-                if length and int(length) > self.max_bytes:
-                    raise ValueError("resource exceeds size limit")
-                data = bytearray()
-                for chunk in response.iter_content(chunk_size=65536):
-                    data.extend(chunk)
-                    if len(data) > self.max_bytes:
+                if unchanged:
+                    data = bytearray((self.previous_dir / previous["local"].lstrip("/")).read_bytes())
+                    self.reused += 1
+                else:
+                    length = headers.get("Content-Length")
+                    if length and int(length) > self.max_bytes:
                         raise ValueError("resource exceeds size limit")
+                    data = bytearray()
+                    for chunk in response.iter_content(chunk_size=65536):
+                        data.extend(chunk)
+                        if len(data) > self.max_bytes:
+                            raise ValueError("resource exceeds size limit")
                 rel = self._destination(target, kind)
                 local = "/" + rel.as_posix()
                 # Mark as cached before recursive processing to break asset cycles.
@@ -695,8 +946,15 @@ class MirrorEngine:
                 filename = self.root / rel
                 filename.parent.mkdir(parents=True, exist_ok=True)
                 filename.write_bytes(data)
+                if kind not in TEXT_KINDS:
+                    source = previous if unchanged else headers
+                    etag = source.get("etag") if unchanged else headers.get("ETag")
+                    modified = source.get("last_modified") if unchanged else headers.get("Last-Modified")
+                    if etag or modified:
+                        self.validators[target] = {"etag": etag, "last_modified": modified,
+                                                   "mime": mime, "local": local}
                 return local
-        except (requests.RequestException, ValueError, OSError, LookupError) as exc:
+        except (*FETCH_ERRORS, ValueError, OSError, LookupError) as exc:
             self.visited[target] = None
             self.failures.append(f"{target}: {exc}")
             self.progress(f"Skipped {target}: {exc}")
@@ -706,9 +964,13 @@ class MirrorEngine:
 
     def _replace_link(self, base: str, link: str, hint: str = "", navigation: bool = False) -> str:
         target = self._resolve(base, link)
-        if target is None or (navigation and not self._within_scope(target)):
+        if target is None or (navigation and not self._in_crawl_scope(target)):
             return link
         fragment = urlsplit(link).fragment
+        if (navigation and target not in self.visited and self._page_candidate(target)
+                and not self._is_page_link(target)):
+            # robots.txt or a filter keeps WebMirror out of this page: link to it online.
+            return target + ("#" + fragment if fragment else "")
         if navigation and self._is_page_link(target) and target not in self.visited:
             # Save linked pages later, from the queue, at the path linked to now.
             local = self.queued_pages.get(target)

@@ -2,20 +2,23 @@
 from __future__ import annotations
 
 from queue import Empty, Queue
-from threading import Thread
+from threading import Event, Thread
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
 import webbrowser
 
-from .core import MirrorEngine, MirrorLibrary, MirrorRecord, MirrorServer, normalize_url
+from .core import (
+    MirrorEngine, MirrorLibrary, MirrorPaused, MirrorRecord, MirrorServer, normalize_url,
+    parse_filters,
+)
 
 
 class WebMirrorApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title("WebMirror — Offline website library")
-        root.geometry("850x650")
-        root.minsize(670, 540)
+        root.geometry("850x820")
+        root.minsize(670, 680)
         self.library = MirrorLibrary()
         self.server = MirrorServer(self.library)
         self.queue: Queue[tuple[str, object]] = Queue()
@@ -27,6 +30,14 @@ class WebMirrorApp:
         self.full_assets = tk.BooleanVar(value=False)
         self.dynamic_assets = tk.BooleanVar(value=True)
         self.manual_verification = tk.BooleanVar(value=True)
+        self.auto_solve = tk.BooleanVar(value=False)
+        self.browserlike = tk.BooleanVar(value=True)
+        self.block_ads = tk.BooleanVar(value=True)
+        self.polite = tk.BooleanVar(value=True)
+        self.obey_robots = tk.BooleanVar(value=False)
+        self.update_unchanged = tk.BooleanVar(value=True)
+        self.filters = tk.StringVar()
+        self.pause_event: Event | None = None
         self.status = tk.StringVar(value="Ready to mirror a website.")
         self.site_details = tk.StringVar(value="Choose a saved website.")
         self.host_status = tk.StringVar(value="Local server stopped.")
@@ -59,6 +70,8 @@ class WebMirrorApp:
         self.mirror_button = ttk.Button(download_box, text="Mirror website",
                                         command=self.start_mirror, style="Action.TButton")
         self.mirror_button.grid(row=0, column=1)
+        self.pause_button = ttk.Button(download_box, text="Pause", command=self.pause_mirror)
+        self.pause_button.grid(row=0, column=2, padx=(6, 0))
         ttk.Label(download_box, text="Example: https://ianbauters.github.io/terrain-press/",
                   style="Note.TLabel").grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.full_checkbox = ttk.Checkbutton(
@@ -66,21 +79,48 @@ class WebMirrorApp:
             text="GitHub Pages: include all published repository files (may be a large download)",
             variable=self.full_assets,
         )
-        self.full_checkbox.grid(row=2, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        self.full_checkbox.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
         self.dynamic_checkbox = ttk.Checkbutton(
             download_box,
             text="Capture JavaScript-loaded assets with Chrome or Edge (recommended for web apps)",
             variable=self.dynamic_assets,
         )
-        self.dynamic_checkbox.grid(row=3, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        self.dynamic_checkbox.grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
         self.verification_checkbox = ttk.Checkbutton(
             download_box,
             text="Let me complete human-verification checks in an opened browser (up to 3 min)",
             variable=self.manual_verification,
         )
         self.verification_checkbox.grid(
-            row=4, column=0, columnspan=2, sticky="w", pady=(7, 0)
+            row=4, column=0, columnspan=3, sticky="w", pady=(4, 0)
         )
+        self.auto_solve_checkbox = ttk.Checkbutton(
+            download_box,
+            text="Solve Cloudflare checks automatically with Scrapling's stealth browser (optional)",
+            variable=self.auto_solve,
+        )
+        self.auto_solve_checkbox.grid(row=5, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        options = ttk.Frame(download_box)
+        options.grid(row=6, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self.option_checkboxes = []
+        for index, (text, variable) in enumerate((
+            ("Request pages the way Chrome does", self.browserlike),
+            ("Block ads and trackers", self.block_ads),
+            ("Slow down when a site is busy", self.polite),
+            ("Obey robots.txt", self.obey_robots),
+            ("Only re-download files that changed", self.update_unchanged),
+        )):
+            box = ttk.Checkbutton(options, text=text, variable=variable)
+            box.grid(row=index // 2, column=index % 2, sticky="w", padx=(0, 24), pady=(0, 4))
+            self.option_checkboxes.append(box)
+        filter_row = ttk.Frame(download_box)
+        filter_row.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(3, 0))
+        filter_row.columnconfigure(1, weight=1)
+        ttk.Label(filter_row, text="Filters").grid(row=0, column=0, padx=(0, 8))
+        self.filter_entry = ttk.Entry(filter_row, textvariable=self.filters)
+        self.filter_entry.grid(row=0, column=1, sticky="ew")
+        ttk.Label(filter_row, text="Optional, e.g. +*.glb -*/forum/*  (+ adds, - leaves out; the last match wins)",
+                  style="Note.TLabel").grid(row=1, column=1, sticky="w", pady=(3, 0))
 
         library_box = ttk.LabelFrame(panel, text="2 · Saved websites", padding=12)
         library_box.grid(row=2, column=0, sticky="nsew", pady=(0, 12))
@@ -166,6 +206,11 @@ class WebMirrorApp:
         self.full_checkbox.configure(state="disabled" if self.busy else "normal")
         self.dynamic_checkbox.configure(state="disabled" if self.busy else "normal")
         self.verification_checkbox.configure(state="disabled" if self.busy else "normal")
+        self.auto_solve_checkbox.configure(state="disabled" if self.busy else "normal")
+        for box in self.option_checkboxes:
+            box.configure(state="disabled" if self.busy else "normal")
+        self.filter_entry.configure(state="disabled" if self.busy else "normal")
+        self.pause_button.configure(state="normal" if self.busy else "disabled")
         can_select = self.selected() is not None and not self.busy
         self.host_button.configure(state="normal" if can_select else "disabled")
         self.delete_button.configure(state="normal" if can_select else "disabled")
@@ -180,12 +225,38 @@ class WebMirrorApp:
         except ValueError as exc:
             messagebox.showerror("Invalid URL", str(exc), parent=self.root)
             return
+        filters = self.filters.get().strip()
+        try:
+            parse_filters(filters)
+        except ValueError as exc:
+            messagebox.showerror("Invalid filter", str(exc), parent=self.root)
+            return
+        resume = False
+        if self.library.is_paused(url):
+            answer = messagebox.askyesnocancel(
+                "Resume paused mirror",
+                "This website has a paused mirror. Resume where it stopped?\n\n"
+                "Yes resumes it. No starts over and discards the paused copy.",
+                parent=self.root,
+            )
+            if answer is None:
+                return
+            resume = answer
+            if not resume:
+                self.library.discard_paused(url)
         self.busy = True
+        pause_event = self.pause_event = Event()
         self.status.set("Downloading website...")
         self._write_log(f"Starting: {url}")
         include_pages_files = self.full_assets.get()
         browser_capture = self.dynamic_assets.get()
         manual_verification = browser_capture and self.manual_verification.get()
+        options = dict(
+            auto_solve_challenges=browser_capture and self.auto_solve.get(),
+            browserlike=self.browserlike.get(), block_ads=self.block_ads.get(),
+            polite=self.polite.get(), obey_robots=self.obey_robots.get(),
+            update_unchanged=self.update_unchanged.get(), filters=filters or None,
+        )
         self._controls()
 
         def worker() -> None:
@@ -198,11 +269,21 @@ class WebMirrorApp:
                     on_verification_required=lambda message: self.queue.put(
                         ("verification", message)
                     ),
-                ).mirror(url)
+                    pause_event=pause_event,
+                    **options,
+                ).mirror(url, resume=resume)
                 self.queue.put(("done", result))
+            except MirrorPaused:
+                self.queue.put(("paused", url))
             except Exception as exc:
                 self.queue.put(("error", str(exc)))
         Thread(target=worker, daemon=True, name="webmirror-download").start()
+
+    def pause_mirror(self) -> None:
+        if self.busy and self.pause_event is not None and not self.pause_event.is_set():
+            self.pause_event.set()
+            self.status.set("Pausing after the current page...")
+            self._write_log("Pausing after the current page...")
 
     def _poll(self) -> None:
         try:
@@ -224,6 +305,11 @@ class WebMirrorApp:
                     self.status.set("Website mirror saved.")
                     self._write_log(f"Finished: {value.url}")
                     self.refresh(select_key=value.key)
+                elif kind == "paused":
+                    self.busy = False
+                    self.status.set("Mirror paused. Mirror the same address again to resume.")
+                    self._write_log(f"Paused: {value}")
+                    self._controls()
                 elif kind == "error":
                     self.busy = False
                     self.status.set("Mirror failed; see the activity log.")
@@ -278,6 +364,8 @@ class WebMirrorApp:
             self.refresh()
 
     def close(self) -> None:
+        if self.pause_event is not None:
+            self.pause_event.set()
         self.server.stop()
         self.root.destroy()
 
