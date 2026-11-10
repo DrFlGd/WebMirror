@@ -96,7 +96,7 @@ class WebMirrorApp:
         )
         self.auto_solve_checkbox = ttk.Checkbutton(
             download_box,
-            text="Solve Cloudflare checks automatically with Scrapling's stealth browser (optional)",
+            text="Try to pass Cloudflare checks automatically (optional)",
             variable=self.auto_solve,
         )
         self.auto_solve_checkbox.grid(row=5, column=0, columnspan=3, sticky="w", pady=(4, 0))

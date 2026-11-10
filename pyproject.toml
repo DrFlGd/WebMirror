@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "webmirror"
-version = "0.4.0"
+version = "0.4.1"
 description = "Desktop GUI to mirror and locally host static websites"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,11 +12,11 @@ dependencies = ["requests>=2.31,<3", "beautifulsoup4>=4.12,<5"]
 
 [project.optional-dependencies]
 test = ["pytest>=8,<10"]
-dynamic = ["playwright>=1.50,<2"]
+# Browser capture. patchright is Playwright with its automation traces removed;
+# plain Playwright also works, without the help passing Cloudflare checks.
+dynamic = ["patchright>=1.50,<2"]
 # Requests that look like Chrome's, TLS handshake included.
 browserlike = ["curl_cffi>=0.7,<1"]
-# Optional automatic Cloudflare solving in browser capture.
-stealth = ["scrapling[fetchers]>=0.5.1,<0.6"]
 
 [project.scripts]
 webmirror = "webmirror.gui:main"

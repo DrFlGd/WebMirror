@@ -239,30 +239,35 @@ class SolvedPage(FakePage):
         return []
 
 
-class FakeStealthSession:
-    def __init__(self, page, options):
-        self.page = page
-        self.options = options
+class FakeStealthContext:
+    def __init__(self, page):
+        self.pages = [page]
         self.closed = False
 
-    def fetch(self, url, *, page_setup, page_action):
-        page_setup(self.page)
-        self.page.goto(url)
-        page_action(self.page)
+    def route(self, pattern, handler):
+        pass
 
     def close(self):
         self.closed = True
 
 
+def stealth_browser(monkeypatch, page):
+    """Replace the stealth browser with one fake page; record how it was used."""
+    used = {"contexts": [], "solved": []}
+
+    def stealth_context(playwright):
+        context = FakeStealthContext(page)
+        used["contexts"].append(context)
+        return context, None
+
+    monkeypatch.setattr("webmirror.browser._stealth_context", stealth_context)
+    monkeypatch.setattr("webmirror.browser.solve", lambda pg, log: used["solved"].append(pg) or True)
+    return used
+
+
 def test_auto_solve_captures_through_the_stealth_browser(monkeypatch):
     pw = fake_playwright(monkeypatch)
-    sessions = []
-
-    def stealth(**options):
-        sessions.append(FakeStealthSession(SolvedPage(), options))
-        return sessions[-1]
-
-    monkeypatch.setattr("webmirror.browser._stealth_session", stealth)
+    used = stealth_browser(monkeypatch, SolvedPage())
     logs = []
     assets = capture_public_assets(
         "https://example.org/app/", max_files=10, max_bytes=100000,
@@ -271,9 +276,9 @@ def test_auto_solve_captures_through_the_stealth_browser(monkeypatch):
         auto_solve=True,
     )
     assert pw.launched == [True]  # no visible browser
-    assert sessions[0].options["solve_cloudflare"] and sessions[0].closed
+    assert used["solved"] and used["contexts"][0].closed
     assert [item[0] for item in assets] == ["https://example.org/app/", "https://example.org/app.js"]
-    assert any("solved automatically" in message for message in logs)
+    assert any("passed automatically" in message for message in logs)
 
 
 def test_auto_solve_failure_falls_back_to_manual_verification(monkeypatch):
@@ -283,10 +288,11 @@ def test_auto_solve_failure_falls_back_to_manual_verification(monkeypatch):
         def __init__(self):
             super().__init__(headless=True, never_solve=True)
 
-    def stealth(**options):
-        return FakeStealthSession(StillChallenged(), options)
+        @property
+        def pages(self):
+            return [self]
 
-    monkeypatch.setattr("webmirror.browser._stealth_session", stealth)
+    stealth_browser(monkeypatch, StillChallenged())
     notices = []
     logs = []
     assets = capture_public_assets(
@@ -297,21 +303,61 @@ def test_auto_solve_failure_falls_back_to_manual_verification(monkeypatch):
     )
     assert pw.launched == [True, False]
     assert len(notices) == 1
-    assert any("could not be solved automatically" in message for message in logs)
+    assert any("could not be passed automatically" in message for message in logs)
     assert [item[0] for item in assets][0] == "https://example.org/app/"
 
 
-def test_auto_solve_without_scrapling_explains_how_to_install(monkeypatch):
+def test_auto_solve_without_a_browser_says_so(monkeypatch):
     fake_playwright(monkeypatch)
-    monkeypatch.setitem(__import__("sys").modules, "scrapling", None)
-    monkeypatch.setitem(__import__("sys").modules, "scrapling.fetchers", None)
+    from webmirror.browser import BrowserUnavailable
+
+    def no_browser(playwright):
+        raise BrowserUnavailable("No Chrome, Edge or Chromium browser could start for automatic solving.")
+
+    monkeypatch.setattr("webmirror.browser._stealth_context", no_browser)
     logs = []
     assets = capture_public_assets(
         "https://example.org/app/", max_files=10, max_bytes=100000,
         progress=logs.append, auto_solve=True,
     )
     assert assets == []
-    assert any("pip install 'webmirror[stealth]'" in message for message in logs)
+    assert any("could start for automatic solving" in message for message in logs)
+
+
+def test_cloudflare_challenge_kinds_are_detected():
+    from webmirror.cloudflare import challenge_cleared, detect_challenge
+    assert detect_challenge("window._cf_chl_opt={cType: 'managed', cRay: 'x'}") == "managed"
+    assert detect_challenge("cType: 'non-interactive'") == "non-interactive"
+    assert detect_challenge('<script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script>') == "embedded"
+    assert detect_challenge("<html><body>Hello</body></html>") is None
+    assert challenge_cleared("<html>ok</html>", "managed")
+    assert not challenge_cleared("cType: 'managed'", "managed")
+    assert challenge_cleared("cType: 'managed'", "embedded")
+
+
+def test_cloudflare_scripts_are_not_saved_as_site_files(monkeypatch):
+    pw = fake_playwright(monkeypatch)
+
+    class Page(SolvedPage):
+        def goto(self, url, **kwargs):
+            response = super().goto(url, **kwargs)
+            self.callbacks["response"](FakeResponse(
+                "https://example.org/cdn-cgi/challenge-platform/h/b/orchestrate/x.js", 200,
+                b"cf();", "application/javascript"))
+            return response
+
+    page = Page()
+
+    def launch(*, headless, **kwargs):
+        from tests.test_browser import FakeBrowser
+        browser = FakeBrowser(headless)
+        browser.page = page
+        return browser
+
+    pw.launch = launch
+    assets = capture_public_assets("https://example.org/app/", max_files=10, max_bytes=100000,
+                                   progress=lambda message: None)
+    assert [item[0] for item in assets] == ["https://example.org/app/", "https://example.org/app.js"]
 
 
 def test_engine_passes_options_to_the_browser_capture(tmp_path, monkeypatch):
