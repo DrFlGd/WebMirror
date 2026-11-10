@@ -13,6 +13,13 @@ A small Python desktop app for saving public, mostly static websites and serving
 - Optional **GitHub Pages: include all published repository files** mode to capture data files with dynamically computed names (may consume hundreds of MB).
 - **Dynamic browser capture** (enabled by default in the GUI) observes assets fetched by JavaScript in a clean Chrome/Edge browser session. It can recover lazy bundles, images, fonts, WASM and public initial GET data. The browser opens the entry page and then every linked page under the same path (up to 40), including links a script adds, so each tool page on a hub keeps the engine it loads when opened. A page link that could not be saved opens the live page instead.
 - **Human verification handoff:** If a robot-check interstitial appears, WebMirror can open a visible browser so you complete the check yourself and then continue capturing eligible public assets (subject to website restrictions).
+- **Browser-like requests** (on by default in the GUI): the static crawl's requests look like Chrome's, down to the TLS handshake, so sites that refuse Python scripts with a 403 still serve their pages. Needs `curl_cffi` (included in the downloads; `pip install -e ".[browserlike]"` otherwise).
+- **Ad and tracker blocking** (on by default in the GUI): about 3,500 known ad and tracker domains are never fetched, in the crawl or in the browser, so captures skip analytics junk. Their links are left pointing online.
+- **Polite crawling:** **Slow down when a site is busy** (on by default) waits between requests about as long as the site takes to answer, and when it answers 429 or 503 doubles the wait (or waits what its `Retry-After` asks) and retries up to three times. **Obey robots.txt** (off by default) skips what a site's robots.txt disallows, leaves disallowed pages linking to the live site, and honours `Crawl-delay`.
+- **Pause and resume:** **Pause** stops a mirror after the current page and keeps what it saved. Mirror the same address again and choose **Yes** to continue where it stopped, or **No** to start over.
+- **Only re-download files that changed** (on by default): when a site was mirrored before, WebMirror asks the server whether each saved image, font, model or other binary file changed (`If-None-Match` / `If-Modified-Since`) and reuses the saved copy when it didn't. Pages, styles and scripts are always fetched again.
+- **Filters:** HTTrack-style rules such as `+*.glb -*/forum/*`. `*` matches anything and the last rule that matches a URL decides. `-` leaves matching files and pages out (left-out pages link to the live site); `+` also lets the crawl follow same-site pages outside the starting folder.
+- **Automatic Cloudflare solving** (optional, off by default): if browser capture meets a Cloudflare check, WebMirror retries it in [Scrapling](https://github.com/D4Vinci/Scrapling)'s stealth browser, which solves Turnstile and interstitial checks by itself. If that fails and manual verification is on, the visible-browser handoff below is the fallback. See [Automatic Cloudflare solving](#automatic-cloudflare-solving).
 - Original SPA routes (such as `/drawer` and `/app`) and query-string asset URLs work when hosting offline. Nested client-side routes fall back to the saved app shell.
 - Host only on `127.0.0.1`, not on your network.
 
@@ -38,8 +45,8 @@ Each executable saves mirrors in your user directory (`~/.webmirror/mirrors`), *
 On a computer with Python 3.10+ installed (and Tkinter available):
 
 ```bash
-python -m pip install -e ".[dynamic]" "pyinstaller>=6.11,<7"
-python -m PyInstaller --noconfirm --clean --onefile --windowed --collect-all playwright --name WebMirror launcher.py
+python -m pip install -e ".[dynamic,browserlike,stealth]" "pyinstaller>=6.11,<7"
+python -m PyInstaller --noconfirm --clean --onefile --windowed --collect-all playwright --collect-all patchright --collect-all curl_cffi --collect-all scrapling --collect-all browserforge --collect-all apify_fingerprint_datapoints --name WebMirror launcher.py
 ```
 
 On Windows, the executable appears at `dist/WebMirror.exe`. On Linux it is `dist/WebMirror`. On macOS, GitHub Actions instead packages a `WebMirror.app` bundle with the `--onedir --windowed` flags.
@@ -60,7 +67,7 @@ python -m venv .venv
 source .venv/bin/activate
 # Windows PowerShell:
 # .venv\Scripts\Activate.ps1
-python -m pip install -e ".[dynamic]"
+python -m pip install -e ".[dynamic,browserlike]"   # add ,stealth for automatic Cloudflare solving
 python -m webmirror
 ```
 
@@ -83,9 +90,18 @@ Enable both checkboxes under **Mirror a website**:
 
 If the site presents a recognized challenge (for example a Cloudflare “Just a moment…” page), WebMirror opens a temporary, visible Chrome or Edge window and displays a notice in its GUI. **You** complete the check using the browser window. WebMirror observes the page, resumes capture when the verification clears, and closes the temporary window. Closing the window yourself cancels the verification; checks have a maximum of **three minutes**.
 
-Use this only for publicly accessible pages you are authorized to mirror. **Do not sign into personal accounts, enter passwords, or provide sensitive information in the verification window.** WebMirror uses a fresh temporary browser context and does not reuse your browser profile or save its cookies. It cannot defeat a challenge automatically, bypass site policy, or guarantee that a website permits automated capture even after verification. Cloudflare may still reject the browser. Some backend-dependent app functions remain unavailable offline.
+Use this only for publicly accessible pages you are authorized to mirror. **Do not sign into personal accounts, enter passwords, or provide sensitive information in the verification window.** WebMirror uses a fresh temporary browser context and does not reuse your browser profile or save its cookies. The manual handoff does not solve checks itself (see [Automatic Cloudflare solving](#automatic-cloudflare-solving) for the optional automatic route), cannot bypass site policy, or guarantee that a website permits automated capture even after verification. Cloudflare may still reject the browser. Some backend-dependent app functions remain unavailable offline.
 
 If **Capture JavaScript-loaded assets** is unchecked, verification prompts are disabled. Failed captures do not overwrite older successfully saved snapshots.
+
+## Automatic Cloudflare solving
+
+Tick **Solve Cloudflare checks automatically with Scrapling's stealth browser** (it needs **Capture JavaScript-loaded assets** too). When the normal browser capture meets a Cloudflare check, WebMirror opens Scrapling's patched Chrome in the background, lets it pass the check, and then captures the site from that browser exactly as a normal capture would.
+
+- It uses your installed Google Chrome. Without Chrome, run `scrapling install` once to download Scrapling's own browser (source installs only).
+- From source, install it with `pip install -e ".[stealth]"`. The downloadable apps include it.
+- It is a fresh, temporary profile: no cookies or sign-ins from your own browser are used.
+- Solving a check does not make it acceptable to copy a site. Use it only for sites you are allowed to mirror, and respect their terms and server load. Some sites will still refuse.
 
 ## Important limitations
 
@@ -106,5 +122,7 @@ The app downloads cross-origin **assets referenced by the site**, but does not c
 python -m pip install -e '.[test]'
 pytest -q
 ```
+
+The tests need none of the optional extras; ones that use `curl_cffi` are skipped when it is not installed.
 
 See `webmirror/core.py` for the mirroring engine, `webmirror/gui.py` for the GUI, and `tests/` for the tests.
