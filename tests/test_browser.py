@@ -311,6 +311,7 @@ def test_interactive_capture_observes_export_request_without_payload(monkeypatch
     assert requests == [{
         "method": "POST", "host": "example.org", "path": "/api/export",
         "resourceType": "fetch", "outcome": "http-response", "status": 503,
+        "responseMimeType": "application/json",
     }]
     assert "private" not in str(requests)
     assert any("Interactive diagnostics" in message for message in messages)
