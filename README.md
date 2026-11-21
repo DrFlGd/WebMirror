@@ -103,6 +103,32 @@ Tick **Try to pass Cloudflare checks automatically** (it needs **Capture JavaScr
 - It is a fresh, temporary profile: no cookies or sign-ins from your own browser are used.
 - Solving a check does not make it acceptable to copy a site. Use it only for sites you are allowed to mirror, and respect their terms and server load. Some sites will still refuse.
 
+## Offline WASM and export diagnostics (Phase 1)
+
+Every completed mirror now includes a `.webmirror-compat.json` report beside its
+`manifest.json`. The report records **references** to OpenSCAD/WebAssembly
+runtimes, whether a WASM asset was actually saved, missing script/WASM/data
+assets, and relevant browser request outcomes. A runtime reference is not proof
+that model exports work offline.
+
+For a website where previews load but the download button fails, enable
+**Capture JavaScript-loaded assets**, then opt into **Interactive export
+diagnostics** before mirroring. WebMirror opens a visible browser for 45 seconds
+after the entry page loads. Use the public generator's export controls during
+that window. It observes failed fetches/XHR and non-GET or export-named requests;
+the report includes only HTTP method, host, sanitized path, resource type and
+status/outcome. No URL queries, request or response bodies, cookies or headers
+are stored in the compatibility report. Avoid signing in, submitting private
+information or starting paid actions during this inspection. The website is
+**live** while it is being captured, not sandboxed.
+
+This is diagnostic groundwork, **not** an OpenSCAD WASM export service. Sites
+with server-generated STL/3MF output will still need a local replacement for
+their server endpoint; the follow-up implementation can use the report to
+identify that work. Generator Library already delegates snapshot capture to
+WebMirror, so mirrors made with a newer WebMirror can carry the same report
+without a Generator Library change.
+
 ## Important limitations
 
 ### JavaScript-heavy apps and offline limitations
