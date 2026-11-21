@@ -25,6 +25,8 @@ def test_dependency_and_export_observations_do_not_include_payloads_or_queries()
     # A normal GET is not considered an export action.
     diag.observe_request("https://tools.example/logo.png?token=secret", "GET",
                          "image", "response", 200)
+    diag.observe_request("https://cdn.example/open.wasm?session=secret", "GET",
+                         "fetch", "response", 404, "application/wasm")
     report = diag.report({
         "https://tools.example/not-found.wasm?token=secret": None,
         "https://tools.example/logo.png?token=secret": None,
@@ -39,7 +41,10 @@ def test_dependency_and_export_observations_do_not_include_payloads_or_queries()
         "method": "POST", "host": "api.example", "path": "/v1/render",
         "resourceType": "fetch", "outcome": "network-failed", "status": 503,
     }]
-    assert report["missingAssets"] == [{"host": "tools.example", "path": "/not-found.wasm"}]
+    assert report["missingAssets"] == [
+        {"host": "tools.example", "path": "/not-found.wasm"},
+        {"host": "cdn.example", "path": "/open.wasm"},
+    ]
 
 
 def test_url_metadata_strips_credentials_query_and_opaque_segments():
