@@ -41,6 +41,7 @@ class CompatibilityDiagnostics:
         self._wasm = False
         self._evidence: set[str] = set()
         self._exports: dict[tuple[str, str, str], dict] = {}
+        self._browser_missing: set[tuple[str, str]] = set()
 
     def observe_asset(self, url: str, mime: str, data: bytes) -> None:
         location = safe_location(url)
@@ -67,10 +68,15 @@ class CompatibilityDiagnostics:
             self._evidence.add(path)
 
     def observe_request(self, url: str, method: str, resource_type: str,
-                        event: str, status: int | None = None) -> None:
+                        event: str, status: int | None = None,
+                        content_type: str = "") -> None:
         """Record export-like requests and non-GET calls; never inspect their data."""
         where = safe_location(url)
         method = method.upper()
+        if ((event == "failed" or (isinstance(status, int) and status >= 400))
+                and where["path"].lower().endswith(ASSET_SUFFIXES)
+                and len(self._browser_missing) < MAX_MISSING_ASSETS):
+            self._browser_missing.add((where["host"], where["path"]))
         if (method in ("GET", "HEAD")
                 and not EXPORT_TERMS.search(where["path"])
                 and not (event == "failed" and resource_type in ("fetch", "xhr"))):
@@ -88,17 +94,30 @@ class CompatibilityDiagnostics:
             record["outcome"] = "http-response"
             if isinstance(status, int):
                 record["status"] = status
+            mime = content_type.split(";", 1)[0].strip().lower()[:100]
+            if re.fullmatch(r"[a-z0-9.+_-]+/[a-z0-9.+_-]+", mime):
+                record["responseMimeType"] = mime
 
     def report(self, visited: dict[str, str | None]) -> dict:
         missing = []
+        seen = set()
         for url, local in visited.items():
             if local is not None:
                 continue
             where = safe_location(url)
             if where["path"].lower().endswith(ASSET_SUFFIXES):
-                missing.append(where)
+                key = (where["host"], where["path"])
+                if key not in seen:
+                    missing.append(where)
+                    seen.add(key)
             if len(missing) >= MAX_MISSING_ASSETS:
                 break
+        for host, path in sorted(self._browser_missing):
+            if len(missing) >= MAX_MISSING_ASSETS:
+                break
+            if (host, path) not in seen:
+                missing.append({"host": host, "path": path})
+                seen.add((host, path))
         dependencies = []
         if self._openscad:
             dependencies.append({
