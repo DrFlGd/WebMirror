@@ -28,6 +28,7 @@ from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 from bs4 import BeautifulSoup
 
 from .ad_domains import AD_DOMAINS
+from .diagnostics import COMPAT_FILE, CompatibilityDiagnostics
 from .net import (
     FETCH_ERRORS, USER_AGENT, AutoThrottle, RobotsRules, host_is_blocked,
     make_session, retry_after_seconds,
@@ -244,7 +245,8 @@ class MirrorEngine:
                  pause_event: Event | None = None,
                  throttle: AutoThrottle | None = None,
                  update_unchanged: bool = False,
-                 filters: str | list[str] | None = None):
+                 filters: str | list[str] | None = None,
+                 interactive_diagnostics: bool = False):
         """Options beyond the original static crawl, all off by default:
 
         browserlike: send requests that look like Chrome's (needs curl_cffi).
@@ -280,6 +282,7 @@ class MirrorEngine:
         self.max_bytes = max_bytes
         self.include_pages_files = include_pages_files
         self.browser_capture = browser_capture
+        self.interactive_diagnostics = interactive_diagnostics
         self.manual_verification = manual_verification
         self.on_verification_required = on_verification_required
         self.import_map: dict[str, str] = {}
@@ -301,6 +304,7 @@ class MirrorEngine:
             self.scope = path + "/"
         self.entry_path = path
         self.visited: dict[str, str | None] = {}
+        self.diagnostics = CompatibilityDiagnostics()
         self._browser_assets: dict[str, tuple[str, bytes]] = {}
         self.in_progress: set[str] = set()
         self.failures: list[str] = []
@@ -366,6 +370,10 @@ class MirrorEngine:
                 self._download_github_pages_assets(url)
             self._write_live_links()
             self._write_routes()
+            (self.root / COMPAT_FILE).write_text(
+                json.dumps(self.diagnostics.report(self.visited), indent=2) + "\n",
+                encoding="utf-8",
+            )
             (self.root / VALIDATORS_FILE).write_text(json.dumps(self.validators), encoding="utf-8")
             (self.root / STATE_FILE).unlink(missing_ok=True)
             record = MirrorRecord(
@@ -488,6 +496,8 @@ class MirrorEngine:
                 max_pages=self.max_pages,
                 blocked_domains=AD_DOMAINS if self.block_ads else None,
                 auto_solve=self.auto_solve_challenges,
+                on_request_observed=self.diagnostics.observe_request,
+                interactive_diagnostics=self.interactive_diagnostics,
             )
         except (BrowserUnavailable, OSError, RuntimeError) as exc:
             self.failures.append("Browser capture unavailable: " + str(exc)[:300])
@@ -634,6 +644,7 @@ class MirrorEngine:
             self.visited[target] = local
             return False
         self.visited[target] = local
+        self.diagnostics.observe_asset(target, mime, data)
         if kind in ("html", "css", "js", "manifest"):
             text = data.decode(text_encoding("", data, kind), errors="replace")
             if kind == "html":
@@ -924,6 +935,7 @@ class MirrorEngine:
                     if (final_parts.scheme.lower(), final_parts.netloc.lower()) == self.origin:
                         self.visited.setdefault(final, local)
                 base = final
+                self.diagnostics.observe_asset(target, mime, bytes(data))
                 if kind in ("html", "css", "js", "manifest"):
                     charset = text_encoding(response.headers.get("Content-Type", ""), bytes(data), kind)
                     text = bytes(data).decode(charset, errors="replace")
