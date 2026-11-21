@@ -283,6 +283,7 @@ class MirrorEngine:
         self.include_pages_files = include_pages_files
         self.browser_capture = browser_capture
         self.interactive_diagnostics = interactive_diagnostics
+        self.diagnostics = CompatibilityDiagnostics()
         self.manual_verification = manual_verification
         self.on_verification_required = on_verification_required
         self.import_map: dict[str, str] = {}
