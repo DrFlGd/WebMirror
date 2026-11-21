@@ -29,6 +29,7 @@ class WebMirrorApp:
         self.port = tk.StringVar(value="8000")
         self.full_assets = tk.BooleanVar(value=False)
         self.dynamic_assets = tk.BooleanVar(value=True)
+        self.interactive_diagnostics = tk.BooleanVar(value=False)
         self.manual_verification = tk.BooleanVar(value=True)
         self.auto_solve = tk.BooleanVar(value=False)
         self.browserlike = tk.BooleanVar(value=True)
@@ -100,8 +101,14 @@ class WebMirrorApp:
             variable=self.auto_solve,
         )
         self.auto_solve_checkbox.grid(row=5, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self.interactive_checkbox = ttk.Checkbutton(
+            download_box,
+            text="Interactive export diagnostics: open browser for 45 seconds to test downloads (opt-in)",
+            variable=self.interactive_diagnostics,
+        )
+        self.interactive_checkbox.grid(row=6, column=0, columnspan=3, sticky="w", pady=(4, 0))
         options = ttk.Frame(download_box)
-        options.grid(row=6, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        options.grid(row=7, column=0, columnspan=3, sticky="w", pady=(4, 0))
         self.option_checkboxes = []
         for index, (text, variable) in enumerate((
             ("Request pages the way Chrome does", self.browserlike),
@@ -114,7 +121,7 @@ class WebMirrorApp:
             box.grid(row=index // 2, column=index % 2, sticky="w", padx=(0, 24), pady=(0, 4))
             self.option_checkboxes.append(box)
         filter_row = ttk.Frame(download_box)
-        filter_row.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(3, 0))
+        filter_row.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(3, 0))
         filter_row.columnconfigure(1, weight=1)
         ttk.Label(filter_row, text="Filters").grid(row=0, column=0, padx=(0, 8))
         self.filter_entry = ttk.Entry(filter_row, textvariable=self.filters)
@@ -207,6 +214,7 @@ class WebMirrorApp:
         self.dynamic_checkbox.configure(state="disabled" if self.busy else "normal")
         self.verification_checkbox.configure(state="disabled" if self.busy else "normal")
         self.auto_solve_checkbox.configure(state="disabled" if self.busy else "normal")
+        self.interactive_checkbox.configure(state="disabled" if self.busy else "normal")
         for box in self.option_checkboxes:
             box.configure(state="disabled" if self.busy else "normal")
         self.filter_entry.configure(state="disabled" if self.busy else "normal")
@@ -251,11 +259,13 @@ class WebMirrorApp:
         include_pages_files = self.full_assets.get()
         browser_capture = self.dynamic_assets.get()
         manual_verification = browser_capture and self.manual_verification.get()
+        interactive_diagnostics = browser_capture and self.interactive_diagnostics.get()
         options = dict(
             auto_solve_challenges=browser_capture and self.auto_solve.get(),
             browserlike=self.browserlike.get(), block_ads=self.block_ads.get(),
             polite=self.polite.get(), obey_robots=self.obey_robots.get(),
             update_unchanged=self.update_unchanged.get(), filters=filters or None,
+            interactive_diagnostics=interactive_diagnostics,
         )
         self._controls()
 

@@ -277,3 +277,41 @@ def test_capture_without_follow_opens_only_the_entry_page(monkeypatch):
         "https://example.org/tools/", max_files=50, max_bytes=1000, progress=lambda m: None,
     )
     assert page.opened == ["https://example.org/tools/"]
+
+
+def test_interactive_capture_observes_export_request_without_payload(monkeypatch):
+    from webmirror.diagnostics import CompatibilityDiagnostics
+
+    page = walking_playwright(monkeypatch)
+    diag = CompatibilityDiagnostics()
+    seen_waits = []
+
+    def interact(duration):
+        seen_waits.append(duration)
+        if duration == 45000:
+            request = SimpleNamespace(
+                url="https://example.org/api/export?secret=private",
+                method="POST", resource_type="fetch",
+            )
+            page.callbacks["request"](request)
+            page.callbacks["response"](SimpleNamespace(
+                url=request.url, request=request, status=503,
+                headers={"content-type": "application/json"},
+            ))
+
+    page.wait_for_timeout = interact
+    messages = []
+    capture_public_assets(
+        "https://example.org/tools/", max_files=50, max_bytes=1000,
+        progress=messages.append, interactive_diagnostics=True,
+        on_request_observed=diag.observe_request,
+    )
+    requests = diag.report({})["exportRequests"]
+    assert seen_waits.count(45000) == 1
+    assert requests == [{
+        "method": "POST", "host": "example.org", "path": "/api/export",
+        "resourceType": "fetch", "outcome": "http-response", "status": 503,
+        "responseMimeType": "application/json",
+    }]
+    assert "private" not in str(requests)
+    assert any("Interactive diagnostics" in message for message in messages)
