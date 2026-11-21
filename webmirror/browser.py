@@ -148,6 +148,8 @@ def capture_public_assets(
     max_pages: int = 1,
     blocked_domains: Iterable[str] | None = None,
     auto_solve: bool = False,
+    on_request_observed: Callable[[str, str, str, str, int | None], None] | None = None,
+    interactive_diagnostics: bool = False,
 ) -> list[tuple[str, str, bytes]]:
     """Observe anonymous GET responses and optionally invite the user to verify.
 
@@ -182,8 +184,17 @@ def capture_public_assets(
         while pending:
             on_response(pending.pop(0))
 
+    def observe_request(request, event: str, status: int | None = None) -> None:
+        if on_request_observed is not None:
+            try:
+                on_request_observed(request.url, request.method,
+                                    getattr(request, "resource_type", ""), event, status)
+            except Exception:
+                pass  # Diagnostics must not affect the mirror.
+
     def on_response(response) -> None:
         nonlocal total_bytes
+        observe_request(response.request, "response", response.status)
         target = response.url.split("#", 1)[0]
         parsed = urlsplit(target)
         if (parsed.scheme.lower(), parsed.netloc.lower()) != origin:
@@ -229,8 +240,12 @@ def capture_public_assets(
         return context, page
 
     def listen(page) -> None:
+        page.on("request", lambda req: observe_request(req, "request"))
         page.on("response", lambda response: pending.append(response))
-        page.on("requestfailed", lambda req: failed.append(req.url[:180]))
+        def request_failed(req):
+            observe_request(req, "failed")
+            failed.append(req.url[:180])
+        page.on("requestfailed", request_failed)
 
     def navigate(page, target=url):
         response = None
@@ -286,7 +301,7 @@ def capture_public_assets(
             progress(f"Page limit reached; {len(queue)} linked pages were not opened in the browser.")
 
     with sync_playwright() as playwright:
-        browser = _launch_chromium(playwright, headless=True)
+        browser = _launch_chromium(playwright, headless=not interactive_diagnostics)
         try:
             context, page = create_page(browser)
             try:
@@ -297,6 +312,16 @@ def capture_public_assets(
                     settle(page)
                     challenged = _page_is_challenged(page, response)
                 if not challenged:
+                    if interactive_diagnostics:
+                        progress("Interactive diagnostics: use the opened browser to try a "
+                                 "public generator export within 45 seconds. No request "
+                                 "bodies, headers, cookies, or query strings are recorded. "
+                                 "Do not sign in, enter private data, or make purchases.")
+                        try:
+                            page.wait_for_timeout(45000)
+                            drain()
+                        except Exception:
+                            progress("Interactive diagnostics window was closed.")
                     visit_rest(page)
             finally:
                 context.close()
