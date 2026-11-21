@@ -83,7 +83,9 @@ def test_static_mirror_writes_compatibility_report(tmp_path):
         assert report["dependencies"][0]["wasmObserved"] is True
         assert {"host": "127.0.0.1", "path": "/tool/missing.js"} in report["missingAssets"]
         assert "secret" not in json.dumps(report)
-        assert (root / "tool/engine.wasm").read_bytes() == b"\\0asm"
+        routes = json.loads((root / ".webmirror-routes.json").read_text("utf-8"))
+        wasm_file = root / routes["/tool/engine.wasm?session=secret"].lstrip("/")
+        assert wasm_file.read_bytes() == b"\\0asm"
     finally:
         server.shutdown()
         server.server_close()
