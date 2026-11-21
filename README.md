@@ -116,8 +116,8 @@ For a website where previews load but the download button fails, enable
 diagnostics** before mirroring. WebMirror opens a visible browser for 45 seconds
 after the entry page loads. Use the public generator's export controls during
 that window. It observes failed fetches/XHR and non-GET or export-named requests;
-the report includes only HTTP method, host, sanitized path, resource type and
-status/outcome. No URL queries, request or response bodies, cookies or headers
+the report includes only HTTP method, host, sanitized path, request resource type,
+response MIME type (when available), and status/outcome. No URL queries, request or response bodies, cookies or headers
 are stored in the compatibility report. Avoid signing in, submitting private
 information or starting paid actions during this inspection. The website is
 **live** while it is being captured, not sandboxed.
