@@ -148,7 +148,7 @@ def capture_public_assets(
     max_pages: int = 1,
     blocked_domains: Iterable[str] | None = None,
     auto_solve: bool = False,
-    on_request_observed: Callable[[str, str, str, str, int | None], None] | None = None,
+    on_request_observed: Callable[[str, str, str, str, int | None, str], None] | None = None,
     interactive_diagnostics: bool = False,
 ) -> list[tuple[str, str, bytes]]:
     """Observe anonymous GET responses and optionally invite the user to verify.
@@ -184,17 +184,20 @@ def capture_public_assets(
         while pending:
             on_response(pending.pop(0))
 
-    def observe_request(request, event: str, status: int | None = None) -> None:
+    def observe_request(request, event: str, status: int | None = None,
+                        content_type: str = "") -> None:
         if on_request_observed is not None:
             try:
                 on_request_observed(request.url, request.method,
-                                    getattr(request, "resource_type", ""), event, status)
+                                    getattr(request, "resource_type", ""), event,
+                                    status, content_type)
             except Exception:
                 pass  # Diagnostics must not affect the mirror.
 
     def on_response(response) -> None:
         nonlocal total_bytes
-        observe_request(response.request, "response", response.status)
+        observe_request(response.request, "response", response.status,
+                        response.headers.get("content-type", ""))
         target = response.url.split("#", 1)[0]
         parsed = urlsplit(target)
         if (parsed.scheme.lower(), parsed.netloc.lower()) != origin:
